@@ -1,0 +1,66 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 16, local_size_y = 16) in;   // one workgroup per 16x16 pixel tile
+
+shared vec3  sMin[256];
+shared vec3  sMax[256];
+shared uint  sMaxW;
+shared uint  sCount;
+shared uint  sIdx[TILE_MAX];
+shared float sW[TILE_MAX];
+shared float sCdf[TILE_MAX];
+
+// Pass 1: build a per-tile light list + contribution CDF (the MegaLights-style importance step).
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uvec2 px = gl_GlobalInvocationID.xy;
+    uint tile = gl_WorkGroupID.y * U.misc2.x + gl_WorkGroupID.x;
+
+    // 1) world-space AABB of the tile's visible surface points
+    vec3 pmin = vec3(1e30), pmax = vec3(-1e30);
+    if (all(lessThan(px, U.misc0.xy))) {
+        vec4 nd = imageLoad(gND, ivec2(px));
+        if (nd.w > 0.0) { vec3 p = worldPos(px, nd.w); pmin = p; pmax = p; }
+    }
+    sMin[tid] = pmin; sMax[tid] = pmax;
+    if (tid == 0u) { sMaxW = 0u; sCount = 0u; }
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+        if (tid < st) { sMin[tid] = min(sMin[tid], sMin[tid + st]); sMax[tid] = max(sMax[tid], sMax[tid + st]); }
+        barrier();
+    }
+    vec3 bmin = sMin[0] - 0.01, bmax = sMax[0] + 0.01;
+    if (sMin[0].x > sMax[0].x) {                               // sky-only tile
+        if (tid == 0u) { tiles[tile].count = 0u; tiles[tile].totalW = 0.0; }
+        return;
+    }
+
+    // 2) strongest bound in the tile, then keep everything above a relative cutoff
+    uint N = U.misc1.x;
+    float localMax = 0.0;
+    for (uint i = tid; i < N; i += 256u) localMax = max(localMax, lightBound(lights[i], bmin, bmax));
+    atomicMax(sMaxW, floatBitsToUint(localMax));               // positive floats order like uints
+    barrier();
+    float thr = uintBitsToFloat(sMaxW) * U.params2.y;
+
+    for (uint i = tid; i < N; i += 256u) {
+        float w = lightBound(lights[i], bmin, bmax);
+        if (w > 0.0 && w >= thr) {
+            uint slot = atomicAdd(sCount, 1u);
+            if (slot < TILE_MAX) { sIdx[slot] = i; sW[slot] = w; }   // overflow beyond TILE_MAX is dropped
+        }
+    }
+    barrier();
+
+    // 3) prefix sum -> CDF, then write the list out
+    uint cnt = min(sCount, TILE_MAX);
+    if (tid == 0u) {
+        float acc = 0.0;
+        for (uint k = 0u; k < cnt; ++k) { acc += sW[k]; sCdf[k] = acc; }
+        tiles[tile].count = cnt;
+        tiles[tile].totalW = acc;
+    }
+    barrier();
+    if (tid < cnt) { tiles[tile].idx[tid] = sIdx[tid]; tiles[tile].cdf[tid] = sCdf[tid]; }
+}

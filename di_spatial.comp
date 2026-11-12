@@ -1,0 +1,53 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Pass 3: ReSTIR DI spatial reuse. Reads temporal output, writes a separate image
+// so the history used next frame is NOT the spatially blurred one.
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, U.misc0.xy))) return;
+    ivec2 ip = ivec2(px);
+
+    vec4 nd = imageLoad(gND, ip);
+    Res  c  = unpackRes(imageLoad(resTCur, ip));
+    if (nd.w <= 0.0 || (U.misc0.w & 2u) == 0u) { imageStore(resSpatial, ip, packRes(c)); return; }
+
+    vec3 n = nd.xyz;
+    vec3 p = worldPos(px, nd.w);
+    uint s = seedFor(px, U.misc0.z, 4u);
+
+    float wsum = 0.0, selP = 0.0, M = 0.0;
+    uint  selTri = NO_LIGHT;
+    vec2  selB = vec2(0.0);
+
+    if (c.light != NO_LIGHT) {
+        float ph = targetPdf(p, n, c.light, c.u);
+        resUpdate(wsum, selTri, selB, selP, c.light, c.u, ph, ph * c.W * c.M, s);
+        M += c.M;
+    }
+
+    const int NEIGHBORS = 10;
+    float radius = U.params.z;
+    for (int i = 0; i < NEIGHBORS; ++i) {
+        vec2  o = (vec2(rnd(s), rnd(s)) * 2.0 - 1.0) * radius;
+        ivec2 q = ip + ivec2(round(o));
+        if (q == ip || any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(U.misc0.xy)))) continue;
+
+        vec4 nq = imageLoad(gND, q);
+        if (nq.w <= 0.0 || dot(nq.xyz, n) < 0.9 || abs(nq.w - nd.w) > 0.1 * nd.w) continue;
+
+        Res rq = unpackRes(imageLoad(resTCur, q));
+        if (rq.light == NO_LIGHT || rq.M <= 0.0) continue;
+
+        float ph = targetPdf(p, n, rq.light, rq.u);
+        resUpdate(wsum, selTri, selB, selP, rq.light, rq.u, ph, ph * rq.W * rq.M, s);
+        M += rq.M;
+    }
+
+    Res r;
+    r.light = selTri; r.u = selB; r.M = M;
+    r.W = (selP > 0.0 && M > 0.0) ? wsum / (M * selP) : 0.0;
+    imageStore(resSpatial, ip, packRes(r));
+}

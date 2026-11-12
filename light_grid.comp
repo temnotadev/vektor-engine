@@ -1,0 +1,50 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 64) in;                      // one workgroup per world cell
+
+shared uint  sMaxW;
+shared uint  sCount;
+shared uint  sIdx[CELL_MAX];
+shared float sW[CELL_MAX];
+shared float sCdf[CELL_MAX];
+
+// Builds the world-space light grid: per cell, the lights that can reach it and a contribution CDF.
+// Independent of the camera, so the host only runs this when the scene or its lights changed.
+void main() {
+    uint tid = gl_LocalInvocationIndex;
+    uvec3 id = gl_WorkGroupID;
+    uint cell = (id.z * U.gridDim.y + id.y) * U.gridDim.x + id.x;
+    vec3 cs = 1.0 / U.gridInvCell.xyz;
+    vec3 bmin = U.gridMin.xyz + vec3(id) * cs;
+    vec3 bmax = bmin + cs;
+
+    if (tid == 0u) { sMaxW = 0u; sCount = 0u; }
+    barrier();
+
+    uint N = U.misc1.x;
+    float localMax = 0.0;
+    for (uint i = tid; i < N; i += 64u) localMax = max(localMax, lightBound(lights[i], bmin, bmax));
+    atomicMax(sMaxW, floatBitsToUint(localMax));
+    barrier();
+    float thr = uintBitsToFloat(sMaxW) * U.params2.y;
+
+    for (uint i = tid; i < N; i += 64u) {
+        float w = lightBound(lights[i], bmin, bmax);
+        if (w > 0.0 && w >= thr) {
+            uint slot = atomicAdd(sCount, 1u);
+            if (slot < CELL_MAX) { sIdx[slot] = i; sW[slot] = w; }
+        }
+    }
+    barrier();
+
+    uint cnt = min(sCount, CELL_MAX);
+    if (tid == 0u) {
+        float acc = 0.0;
+        for (uint k = 0u; k < cnt; ++k) { acc += sW[k]; sCdf[k] = acc; }
+        cells[cell].count = cnt;
+        cells[cell].totalW = acc;
+    }
+    barrier();
+    if (tid < cnt) { cells[cell].idx[tid] = sIdx[tid]; cells[cell].cdf[tid] = sCdf[tid]; }
+}

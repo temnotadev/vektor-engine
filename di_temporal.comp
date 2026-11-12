@@ -1,0 +1,58 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Pass 2: ReSTIR DI temporal reuse (reproject, validate, merge with history).
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, U.misc0.xy))) return;
+    ivec2 ip = ivec2(px);
+
+    vec4 nd  = imageLoad(gND, ip);
+    Res  cur = unpackRes(imageLoad(resInit, ip));
+    if (nd.w <= 0.0) { imageStore(resTCur, ip, packRes(cur)); return; }
+
+    vec3 n = nd.xyz;
+    vec3 p = worldPos(px, nd.w);
+    uint s = seedFor(px, U.misc0.z, 3u);
+
+    float wsum = 0.0, selP = 0.0, M = 0.0;
+    uint  selTri = NO_LIGHT;
+    vec2  selB = vec2(0.0);
+
+    if (cur.light != NO_LIGHT) {
+        float ph = targetPdf(p, n, cur.light, cur.u);
+        resUpdate(wsum, selTri, selB, selP, cur.light, cur.u, ph, ph * cur.W * cur.M, s);
+        M += cur.M;
+    }
+
+    if ((U.misc0.w & 5u) == 1u && U.misc0.z > 0u) {
+        ivec2 pp;
+        if (reproject(p, pp) && historyValid(pp, p, n)) {
+            Res prev = unpackRes(imageLoad(resTPrev, pp));
+            if (badf(prev.W) || badf(prev.M)) prev = emptyRes();
+            
+            // FIX: Use the full history limit (default 12) instead of clamping to 1.2
+            prev.M = min(prev.M, U.params2.z); 
+            
+            if (prev.light != NO_LIGHT && prev.M > 0.0) {
+                float ph = targetPdf(p, n, prev.light, prev.u);
+                resUpdate(wsum, selTri, selB, selP, prev.light, prev.u, ph, ph * prev.W * prev.M, s);
+                M += prev.M;
+            }
+        }
+    }
+
+    Res r;
+    r.light = selTri; r.u = selB; r.M = M;
+    r.W = (selP > 0.0 && M > 0.0) ? wsum / (M * selP) : 0.0;
+
+    if (r.light != NO_LIGHT && r.W > 0.0) {
+        LightEval e = evalLight(r.light, r.u, p, n);
+        if (occluded(p + n * RAY_EPS, e.wi, e.dist - 2.0 * RAY_EPS)) r.W = 0.0;
+    }
+    
+    if (badf(r.W) || badf(r.M) || badf(wsum)) r = emptyRes();
+    imageStore(resTCur, ip, packRes(r));
+}

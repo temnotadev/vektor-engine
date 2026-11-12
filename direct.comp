@@ -1,0 +1,39 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Pass 5: shade the final ReSTIR sample (1 shadow ray) and accumulate it over time.
+// Stored demodulated (albedo divided out) so the history survives texture/albedo edges.
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, U.misc0.xy))) return;
+    ivec2 ip = ivec2(px);
+
+    vec4 nd  = imageLoad(gND, ip);
+    vec4 alb = imageLoad(gAlbedo, ip);
+    if (nd.w <= 0.0 || alb.a > 0.5) { imageStore(dirCur, ip, vec4(0.0)); return; }
+
+    vec3 n = nd.xyz;
+    vec3 p = worldPos(px, nd.w);
+
+    vec3 Ld = vec3(0.0);
+    Res r = unpackRes(imageLoad(resSpatial, ip));
+    if (r.light != NO_LIGHT && r.W > 0.0) {
+        LightEval e = evalLight(r.light, r.u, p, n);
+        if (!occluded(p + n * RAY_EPS, e.wi, e.dist - 2.0 * RAY_EPS))
+            Ld = e.f * r.W * (1.0 / PI);
+    }
+    float l = luminance(Ld);
+    if (l > 50.0) Ld *= 50.0 / l;                              // firefly clamp
+
+    vec4 outv = vec4(Ld, 1.0);
+    ivec2 pp;
+    if ((U.misc0.w & 1u) != 0u && U.misc0.z > 0u && reproject(p, pp) && historyValid(pp, p, n)) {
+        vec4  hist  = imageLoad(dirPrev, pp);
+        if (any(isnan(hist)) || any(isinf(hist))) hist = vec4(0.0);   // sanitize before use
+        float count = min(hist.a + 1.0, U.params2.z);
+        outv = vec4(mix(hist.rgb, Ld, 1.0 / count), count);
+    }
+    imageStore(dirCur, ip, outv);
+}

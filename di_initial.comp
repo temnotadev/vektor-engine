@@ -1,0 +1,51 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Pass 1: ReSTIR DI initial sampling.
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, U.misc0.xy))) return;
+    ivec2 ip = ivec2(px);
+
+    vec4 nd = imageLoad(gND, ip);
+    if (nd.w <= 0.0) { imageStore(resInit, ip, packRes(emptyRes())); return; }
+
+    vec3 n = nd.xyz;
+    vec3 p = worldPos(px, nd.w);
+    uint s = seedFor(px, U.misc0.z, 1u);
+
+    uint  M = U.misc1.w;
+    float wsum = 0.0, selP = 0.0;
+    uint  selTri = NO_LIGHT;
+    vec2  selB = vec2(0.0);
+
+    uint tile = tileOf(px);
+    for (uint i = 0u; i < M; ++i) {
+        uint li;
+        float P = pickLight(tile, p, s, li);
+        if (P <= 0.0) continue;
+        vec2 u = sampleU(s);
+        LightEval e = evalLight(li, u, p, n);
+        float ph = luminance(e.f);
+        
+        // Firefly clamp: prevent extreme values from poisoning the reservoir
+        float w = ph / (P * e.pdf);
+        w = min(w, 1000.0); 
+        
+        resUpdate(wsum, selTri, selB, selP, li, u, ph, w, s);
+    }
+
+    Res r;
+    r.light = selTri; r.u = selB; r.M = float(M);
+    r.W = selP > 0.0 ? wsum / (float(M) * selP) : 0.0;
+
+    if (r.W > 0.0) {
+        LightEval e = evalLight(r.light, r.u, p, n);
+        if (occluded(p + n * RAY_EPS, e.wi, e.dist - 2.0 * RAY_EPS)) r.W = 0.0;
+    }
+    
+    if (badf(r.W) || badf(r.M) || badf(wsum)) r = emptyRes();
+    imageStore(resInit, ip, packRes(r));
+}

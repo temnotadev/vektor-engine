@@ -1,0 +1,14 @@
+# Test script: verify new defaults and camera lock feature
+
+# Builtin scene with one crate and two lights
+builtin cornell
+spawn crate1 cube pos 0 0 0 size 0.5 0.5 0.5 color 0.8 0.2 0.2
+
+# Test camera lock: freeze the camera
+camera pos 0 2 5
+camera look 0 0
+camera lock on
+
+# Test: should start with 12 DI candidates (candIdx=2) and BVH light mode (lightMode=2)
+# View with keys 1/2/3, reuse with T/Y, toggle candidates with C
+print "Test: camera is locked (frozen position/look), BVH light mode active, 12 DI candidates by default"
