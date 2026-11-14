@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 27, rgba16f) uniform image2D nrdRawGI;
 
 // Next-event estimation at a secondary vertex (path mode): 8-candidate RIS over the world light grid
 // (or the global power table when sampling mode is "global") + 1 shadow ray.
@@ -27,8 +28,9 @@ vec3 nee(vec3 p, vec3 n, vec3 albedo, inout uint s) {
 
 // Screen-space trace (mode 2): march the ray through the depth buffer and, on a hit, reuse LAST FRAME's lit
 // image at that surface as radiance. Cheap and exact for what is on screen; misses fall back to RT + cache.
-bool screenTrace(vec3 p, vec3 n, vec3 dir, inout uint s, out vec3 radiance) {
+bool screenTrace(vec3 p, vec3 n, vec3 dir, inout uint s, out vec3 radiance, out float hitDist) {
     radiance = vec3(0.0);
+    hitDist = 0.0;
     if (U.misc0.z == 0u) return false;
     const int STEPS = 16;
     const float minStep = 0.05;
@@ -55,6 +57,7 @@ bool screenTrace(vec3 p, vec3 n, vec3 dir, inout uint s, out vec3 radiance) {
             ivec2 pp;
             if (!reproject(hp, pp) || !historyValid(pp, hp, nd.xyz)) return false;
             radiance = imageLoad(litPrev, pp).rgb;
+            hitDist = t;
             return true;
         }
     }
@@ -64,8 +67,8 @@ bool screenTrace(vec3 p, vec3 n, vec3 dir, inout uint s, out vec3 radiance) {
 // Pass 8: indirect light, three modes:
 //   0 path   : cosine path, up to giBounces bounces, NEE at every vertex (light grid sampling)
 //   1 cache  : ONE ray per pixel; radiance at the hit = albedo * surface cache (all bounces + all lights already inside)
-//   2 screen : like 1, but the ray is first marched in screen space and reuses last frame's lit image
-// giRate 2 traces one pixel per 2x2 quad per frame and carries the rest forward by reprojection.
+//   2 screen : full-rate screen-space tracing; sparse BVH fallback for off-screen/missed rays
+// giRate 2 traces one pixel per 2x2 quad per frame except in screen mode, where only BVH fallbacks are sparse.
 // Output is demodulated (no primary albedo) and temporally accumulated.
 void main() {
     uvec2 px = gl_GlobalInvocationID.xy;
@@ -73,7 +76,11 @@ void main() {
     ivec2 ip = ivec2(px);
 
     vec4 nd = imageLoad(gND, ip);
-    if (nd.w <= 0.0) { imageStore(giCur, ip, vec4(0.0)); return; }
+    if (nd.w <= 0.0) {
+        imageStore(giCur, ip, vec4(0.0));
+        imageStore(nrdRawGI, ip, vec4(0.0));
+        return;
+    }
 
     vec3 n = nd.xyz;
     vec3 p = worldPos(px, nd.w);
@@ -81,10 +88,17 @@ void main() {
 
     ivec2 pp;
     bool hv = U.misc0.z > 0u && reproject(p, pp) && historyValid(pp, p, n);
-    bool traceNow = U.misc3.y <= 1u || ((px.x & 1u) + 2u * (px.y & 1u)) == (U.misc0.z & 3u);
-    if (!traceNow && hv) { imageStore(giCur, ip, imageLoad(giPrev, pp)); return; }
+    bool traceNow = U.misc3.x == 2u || U.misc3.y <= 1u ||
+                    ((px.x & 1u) + 2u * (px.y & 1u)) == (U.misc0.z & 3u);
+    if (!traceNow && hv) {
+        vec4 hist = imageLoad(giPrev, pp);
+        imageStore(giCur, ip, hist);
+        imageStore(nrdRawGI, ip, vec4(hist.rgb, max(nd.w, 1e-3)));
+        return;
+    }
 
     vec3 Li = vec3(0.0);
+    float hitDist = 0.0;
     if (U.misc3.x == 0u) {
         vec3 throughput = vec3(1.0);
         vec3 pos = p, nrm = n;
@@ -92,6 +106,7 @@ void main() {
             vec3 dir = cosineSample(nrm, vec2(rnd(s), rnd(s)));
             Hit h;
             if (!traceClosest(pos + nrm * RAY_EPS, dir, 1e4, h)) break;
+            if (b == 0u) hitDist = h.t;
             Tri  t  = tris[h.prim];
             vec3 ng = triNormal(t);
             if (dot(ng, dir) > 0.0) ng = -ng;
@@ -107,11 +122,27 @@ void main() {
         bool done = false;
         if (U.misc3.x == 2u) {
             vec3 rad;
-            if (screenTrace(p, n, dir, s, rad)) { Li = rad; done = true; }
+            float screenHitDist;
+            if (screenTrace(p, n, dir, s, rad, screenHitDist)) {
+                Li = rad;
+                hitDist = screenHitDist;
+                done = true;
+            } else {
+                uint fallbackRate = max(U.misc3.w, 1u);
+                uint pixelHash = pcgHash(px.x + pcgHash(px.y));
+                bool fallbackNow = !hv || ((pixelHash + U.misc0.z) % fallbackRate) == 0u;
+                if (!fallbackNow) {
+                    vec4 hist = imageLoad(giPrev, pp);
+                    imageStore(giCur, ip, hist);
+                    imageStore(nrdRawGI, ip, vec4(hist.rgb, max(nd.w, 1e-3)));
+                    return;
+                }
+            }
         }
         if (!done) {
             Hit h;
             if (traceClosest(p + n * RAY_EPS, dir, 1e4, h)) {
+                hitDist = h.t;
                 Tri t = tris[h.prim];
                 bool back = dot(triNormal(t), dir) > 0.0;
                 Li = triAlbedo(t, h.bary, 4.0) * cacheLookup(h.prim, h.bary, back);
@@ -122,6 +153,7 @@ void main() {
     float l = luminance(Li);
     if (l > U.params.w) Li *= U.params.w / l;                 // firefly clamp
 
+    imageStore(nrdRawGI, ip, vec4(Li, hitDist));
     vec4 outv = vec4(Li, 1.0);
     if (hv) {
         vec4  hist  = imageLoad(giPrev, pp);

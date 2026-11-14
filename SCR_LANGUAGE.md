@@ -42,6 +42,7 @@ destroy <name | prefix*>
 set     <name> pos|rot|size|color|emit|dir ...
 move    <name> dx dy dz
 rotate  <name> dx dy dz
+collider <name> [pos x y z] [rot x y z] [size x y z]
 ```
 
 - `spawn` creates an object from a built-in primitive or a loaded model.
@@ -149,6 +150,7 @@ builtin cornell
 builtin pointlights [N]
 builtin spots
 builtin sun
+builtin player [height] [gravity on|off]
 ```
 
 These commands generate common scene layouts:
@@ -157,6 +159,21 @@ These commands generate common scene layouts:
 - `pointlights [N]`: creates a set of point lights
 - `spots`: creates spot lights
 - `sun`: creates a sun-like directional light
+- `player`: enables first-person WASD/mouse movement with jumping and collision
+
+`builtin player [height] [gravity on|off]` enables the first-person player controller: WASD movement, mouse look, gravity, Space to jump, and solid-object collision. Shift moves faster. The optional height is in world units, defaults to `1.8`, and must be greater than twice the controller radius (`0.3`). The camera height scales with it. Set `gravity off` to disable falling and use Q/E to fly vertically; collision remains enabled. The controller starts at the current camera position and automatically enables player collision.
+
+`collider` adds an invisible, solid box. Its center, rotation, and size use the same world units as `spawn`; omitted values default to position/rotation zero and size one. It can be moved, resized, rotated, toggled, or removed with the usual object commands.
+
+Invisible collision boxes can be assigned in a scene file independently of rendered geometry:
+
+```scr
+collider hallway_wall pos 0 1.5 -4 size 8 3 0.2
+collider ramp_block pos 2 0.5 1 rot 0 20 0 size 2 1 3
+builtin player 1.3 gravity off
+```
+
+The player is a capsule-like body approximated by three vertical collision spheres; colliders and other solid objects use oriented boxes. Collision-only boxes are omitted from the rendered scene, but are visible and editable as wireframes in SCR Editor and round-trip through its script importer/exporter.
 
 ### 2.8 Global render options
 
@@ -165,7 +182,7 @@ area on|off
 gi path|cache|screen
 gi rate 1|2
 gi cellsize v
-denoise on|off|<strength>
+denoise on|off|<value>
 collision camera on|off [radius]
 collision <name|prefix*> on|off
 ```
@@ -176,7 +193,7 @@ These commands configure renderer state:
 - `gi`: chooses path tracing, surface cache, or screen-space assist modes.
 - `gi rate`: switches the GI trace rate.
 - `gi cellsize`: controls cache texel cell size.
-- `denoise`: applies denoising with a strength from 0 to 4.
+- `denoise`: enables NRD denoising when the value is positive; `0` disables it.
 - `collision camera`: blocks camera movement through solid objects.
 - `collision <name>`: toggles object solidity for collisions.
 
@@ -300,6 +317,7 @@ The engine approximates every collidable object as an oriented bounding box (OBB
 - Only objects with `collide on` are considered in collision tests.
 - The camera can also be considered a collision body with default radius `0.3`.
 - Collision events fire once when a pair of objects starts overlapping.
+- `collider` objects are invisible oriented boxes and participate in player, camera, and scripted object collision.
 
 This keeps the scripting layer simple while still supporting object interaction and room-scale gameplay logic.
 

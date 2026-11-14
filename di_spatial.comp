@@ -36,7 +36,13 @@ void main() {
         if (q == ip || any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(U.misc0.xy)))) continue;
 
         vec4 nq = imageLoad(gND, q);
-        if (nq.w <= 0.0 || dot(nq.xyz, n) < 0.9 || abs(nq.w - nd.w) > 0.1 * nd.w) continue;
+        if (nq.w <= 0.0 || dot(nq.xyz, n) < 0.95) continue;
+
+        vec3 pq = worldPos(uvec2(q), nq.w);
+        float depthTolerance = max(4.0 * RAY_EPS,
+                                   max(length(p - U.camPos.xyz), length(pq - U.camPos.xyz)) * U.params2.w);
+        if (abs(dot(pq - p, n)) > depthTolerance ||
+            abs(dot(pq - p, nq.xyz)) > depthTolerance) continue;
 
         Res rq = unpackRes(imageLoad(resTCur, q));
         if (rq.light == NO_LIGHT || rq.M <= 0.0) continue;
@@ -49,5 +55,15 @@ void main() {
     Res r;
     r.light = selTri; r.u = selB; r.M = M;
     r.W = (selP > 0.0 && M > 0.0) ? wsum / (M * selP) : 0.0;
+
+    bool reusedNeighbor = c.W <= 0.0 || r.light != c.light || any(notEqual(r.u, c.u));
+    if (reusedNeighbor && r.light != NO_LIGHT && r.W > 0.0) {
+        LightEval e = evalLight(r.light, r.u, p, n);
+        if (occluded(p + n * RAY_EPS, e.wi, e.dist - 2.0 * RAY_EPS)) {
+            if (c.light != NO_LIGHT && c.W > 0.0) r = c;
+            else r = emptyRes();
+        }
+    }
+
     imageStore(resSpatial, ip, packRes(r));
 }

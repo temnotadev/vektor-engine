@@ -6,21 +6,28 @@
 //   texture <id> <image>                       load PNG/JPG/TGA/BMP (resized to 512x512 + mipmaps)
 //   model   <id> <file.obj> [raw]              load OBJ; by default fitted to 1 unit, base on y=0
 //   spawn   <name> <cube|quad|sphere|modelId> [pos x y z] [rot x y z] [size x y z | scale s]
-//                  [color r g b] [tex id] [uvscale s] [emit r g b] [collide on|off]
+//                  [color r g b] [tex id] [uvscale s] [wrap repeat|clamp] [filter linear|nearest] [emit r g b] [collide on|off]
 //           (name ending in '#' gets a running number: crate# -> crate1, crate2, ...)
 //   destroy <name | prefix*>
-//   set     <name> pos|rot|size|color|emit|dir ... | scale s | tex id|none | uvscale s | range v | radius v
+//   set     <name> pos|rot|size|color|emit|dir ... | scale s | tex id|none | uvscale s | wrap repeat|clamp | filter linear|nearest | range v | radius v
 //   move    <name> dx dy dz       rotate <name> dx dy dz (degrees)
 //   light point <name> x y z  r g b  range [radius]
 //   light spot  <name> x y z  dx dy dz  r g b  range outerDeg innerDeg [radius]
 //   light sun   <name> dx dy dz  r g b  [angularRadiusDeg]
 //   camera pos x y z | camera look yawDeg pitchDeg | camera lock on|off
 //   var $v value | calc $v a + - * / min max b | rand $v min max | if a < > <= >= == != b ... endif
+//   collider <name> [pos x y z] [rot x y z] [size x y z]
 //   builtin cornell | builtin pointlights [N] | builtin spots | builtin sun
+//   builtin player [height] [gravity on|off]
 //   area on|off                    emissive triangles emit light (off: only point/spot/sun lights remain)
-//   gi path|cache|screen           GI mode: path tracing with NEE | surface cache | surface cache + screen traces
-//   gi rate 1|2 | gi cellsize v    GI trace rate (2 = quarter of the pixels per frame), surface-cache texel size
-//   denoise on|off|<strength>      spatial denoise of direct + GI in the composite pass (default 1, 0 = off, up to 4)
+//   gi path|cache|screen           GI mode: path tracing with NEE | surface cache | screen traces + BVH fallback
+//   gi rate 1|2 | gi offscreen n | gi cellsize v
+//                                  screen-mode BVH fallback rate (1/n pixels per frame); surface-cache texel size
+//   denoise on|off|<value>         NRD denoising of direct + GI (default on, 0 = off)
+//   dlss off|quality|balanced|performance|ultra-performance|ultra-quality
+//                                  Streamline DLSS Super Resolution mode (default off)
+//   sky gradient <zr zg zb> <hr hg hb> | sky color r g b | sky intensity v | sky off
+//                                  procedural sky shown where rays miss geometry (dim by default)
 //   collision camera on|off [radius]   the camera cannot move through solid objects (default off, radius 0.3)
 //   collision <name|prefix*> on|off    make objects solid / non-solid (same as: set <name> collide on|off)
 //   print <text>
@@ -91,7 +98,7 @@ struct GpuTri {                                     // std430, 112 bytes
     float p0[4], p1[4], p2[4], albedo[4], emission[4];
     float uv01[4];                                  // uv0.xy, uv1.xy
     float uv2m[4];                                  // uv2.xy, texture layer (-1 = none), uv-per-world-unit footprint
-    uint32_t cache[4];                              // x = first surface-cache texel, y = grid size k (0 = not cached)
+    uint32_t cache[4];                              // x/y = cache texels/grid size, z/w = texture wrap/filter modes
 };
 static_assert(sizeof(GpuTri) == 128, "GpuTri must match the std430 Tri struct in common.glsl");
 
@@ -126,7 +133,9 @@ struct Object {
     std::string name; int mesh = 0;
     V3 pos{0, 0, 0}, rot{0, 0, 0}, size{1, 1, 1}, color{0.73f, 0.73f, 0.73f}, emit{0, 0, 0};
     int tex = -1; float uvscale = 1.0f;
+    bool texClamp = false, texNearest = false;
     bool collide = true;                              // solid for the camera and for "on collide" events
+    bool collisionOnly = false;
 };
 struct LightDef {
     std::string name; uint32_t type = LIGHT_POINT;
@@ -341,7 +350,6 @@ inline void buildAlias(const std::vector<float>& w, std::vector<float>& prob, st
 // largest axis (SAH would pick tighter splits, but at MAX_LIGHTS scale this is cheap and good enough:
 // each node still carries an exact AABB + power sum, which is all the GPU traversal needs to be unbiased).
 // Output is a flat array of 2*N-1 nodes (N leaves, N-1 interior), root at index 0; empty input -> empty tree.
-// ---- Light BVH builder (power + spatial importance sampling, RTXDI/Moana-style light cluster tree)
 inline void buildLightBVH(const std::vector<GpuLight>& lights, std::vector<GpuBVHNode>& nodes) {
     nodes.clear();
     size_t n = lights.size();
@@ -394,12 +402,23 @@ inline void buildLightBVH(const std::vector<GpuLight>& lights, std::vector<GpuBV
     build(0, n);
 }
 
+struct CustomShader {
+    std::string id, path;            // path is already resolved
+    int  stage = 1;                  // 0 = after gbuffer, 1 = post (after composite)
+    bool enabled = true;             // run every frame
+    uint32_t runOnce = 0;            // pending one-shot dispatches
+    bool customGroups = false; uint32_t groups[3] = {1, 1, 1};
+    float pc[16] = {};               // push constants
+    bool recompile = true;           // main.cpp clears this after compiling
+};
+
 // ------------------------------------------------------------------ world
 struct World {
     std::vector<Mesh> meshes;
     std::map<std::string, int> meshIndex, modelByKey;
     std::vector<Object> objects;
     std::vector<LightDef> lights;
+    std::vector<CustomShader> shaders;
     std::map<std::string, int> texIds, texByPath;     // texIds: script name -> layer, texByPath: cache
     int texCount = 0;
     std::vector<TexUpload> pendingTex;                // CPU-loaded, waiting for the renderer to upload
@@ -410,12 +429,23 @@ struct World {
     bool dirty = true;                                // scene needs re-upload / BLAS rebuild
     bool areaLights = true;                           // false: emissive triangles stop emitting (point/spot/sun only)
     int giMode = 1;                                   // 0 path (NEE), 1 surface cache, 2 surface cache + screen traces
-    int giRate = 1;                                   // 1 = trace GI for every pixel each frame, 2 = one pixel per 2x2 quad
-    float cacheCellSize = 0.3f;                       // surface cache texel size in world units
-    float denoise = 1.0f;                             // composite-pass spatial filter strength (0 = off)
+    int giRate = 2;                                   // 1 = trace GI for every pixel each frame, 2 = one pixel per 2x2 quad
+    uint32_t giOffscreenRate = 8;                     // screen mode: BVH fallback for one in n missed screen-space rays
+    float cacheCellSize = 0.7f;                       // surface cache texel size in world units
+    float denoise = 1.0f;                             // NRD denoising enabled when positive
+    int dlssMode = 0;                                 // 0 off, 1 quality, 2 balanced, 3 performance, 4 ultra-performance, 5 ultra-quality
+    V3 skyZenith{0.10f, 0.18f, 0.35f};                // sky color at dir.y = +1 (multiplied by skyIntensity)
+    V3 skyHorizon{0.55f, 0.62f, 0.72f};               // sky color at dir.y <= 0
+    float skyIntensity = 0.5f;                        // global multiplier; 0 = sky off (keeps the sun dominant)
     bool camCollide = false;                          // camera is blocked by solid objects
     bool camLocked = false;                           // camera movement is frozen (scriptable via 'camera lock on|off')
     float camRadius = 0.3f;                           // camera collision sphere radius
+    bool playerController = false;
+    bool playerGravity = true;
+    bool playerGrounded = false;
+    float playerRadius = 0.3f, playerHeight = 1.8f, playerEyeHeight = 1.62f;
+    float playerSpeed = 4.5f, playerJumpSpeed = 5.2f, playerVelocityY = 0.0f;
+    V3 playerFeet{0, 0, 0};
     std::map<int, std::pair<V3, V3>> boundsCache;     // mesh index -> local min / max (meshes never change once added)
 
     // mirrors of runtime state (main.cpp keeps these in sync)
@@ -427,9 +457,15 @@ struct World {
         for (Mesh m : {makeCube(), makeQuad(), makeSphere()}) { meshIndex[m.name] = (int)meshes.size(); meshes.push_back(m); }
     }
     void clearScene() {                               // keeps meshes and texture cache
-        objects.clear(); lights.clear(); vars.clear(); texIds.clear(); spawnCounter = 0; dirty = true;
-        areaLights = true; giMode = 1; giRate = 1; cacheCellSize = 0.3f;
-        denoise = 1.0f; camCollide = false; camLocked = false; camRadius = 0.3f;
+        objects.clear(); lights.clear(); shaders.clear(); vars.clear(); texIds.clear(); spawnCounter = 0; dirty = true;
+        areaLights = true; giMode = 1; giRate = 1; giOffscreenRate = 8; cacheCellSize = 0.3f;
+        denoise = 1.0f; dlssMode = 0; camCollide = false; camLocked = false; camRadius = 0.3f;
+        playerController = false; playerGravity = true; playerGrounded = false; playerVelocityY = 0.0f;
+        playerRadius = 0.3f; playerHeight = 1.8f; playerEyeHeight = 1.62f;
+        playerSpeed = 4.5f; playerJumpSpeed = 5.2f;
+        skyZenith  = {0.10f, 0.18f, 0.35f};
+        skyHorizon = {0.55f, 0.62f, 0.72f};
+        skyIntensity = 0.5f;
         rng.seed(12345);
     }
 
@@ -458,10 +494,7 @@ struct World {
         b.h[2] = 0.5f * (bb.second.z - bb.first.z) * std::fabs(o.size.z);
         return b;
     }
-    // Push a camera sphere (camRadius) out of every solid object. oldPos (last frame) only decides which side to
-    // leave through when the centre ends up inside a box or on a zero-thickness quad.
-    V3 resolveCamera(const std::vector<OBB>& boxes, V3 oldPos, V3 p) {
-        const float r = camRadius;
+    V3 resolveSphere(const std::vector<OBB>& boxes, V3 oldPos, V3 p, float r) {
         for (int iter = 0; iter < 4; ++iter) {
             bool moved = false;
             for (const OBB& b : boxes) {
@@ -472,7 +505,10 @@ struct World {
                 V3 delta = d - closest;                       // closest point on the box -> camera
                 float dist = length(delta);
                 if (dist >= r) continue;
-                if (dist > 1e-5f) p = p + delta * ((r - dist) / dist);
+                if (dist > 1e-5f) {
+                    if (dot(delta, oldPos - p) < 0.0f) delta = delta * -1.0f; // stay on the side we approached from
+                    p = p + delta * ((r - dist) / dist);
+                }
                 else {                                        // centre inside / on the box: leave along the shallowest axis
                     int best = 0; float bestPen = 1e30f;
                     for (int i = 0; i < 3; ++i) { float pen = b.h[i] + r - std::fabs(l[i]); if (pen < bestPen) { bestPen = pen; best = i; } }
@@ -484,6 +520,20 @@ struct World {
             if (!moved) break;
         }
         return p;
+    }
+    // The player capsule is approximated by three overlapping spheres along its vertical axis.
+    V3 resolvePlayer(const std::vector<OBB>& boxes, V3 oldFeet, V3 feet) {
+        const float offsets[3] = {playerRadius, playerHeight * 0.5f, playerHeight - playerRadius};
+        for (int iter = 0; iter < 4; ++iter) {
+            V3 before = feet;
+            for (float offset : offsets) {
+                V3 oldCenter = oldFeet + V3{0, offset, 0};
+                V3 center = feet + V3{0, offset, 0};
+                feet = feet + (resolveSphere(boxes, oldCenter, center, playerRadius) - center);
+            }
+            if (length(feet - before) < 1e-5f) break;
+        }
+        return feet;
     }
     // Move the camera from 'from' to 'to' in sub-steps of at most half the camera radius, so fast movement
     // cannot tunnel through thin geometry (the room walls are zero-thickness quads).
@@ -497,9 +547,62 @@ struct World {
         V3 p = from;
         for (int i = 1; i <= steps; ++i) {
             V3 next = from + d * (float(i) / float(steps));
-            p = resolveCamera(boxes, p, next);
+            p = resolveSphere(boxes, p, next, camRadius);
         }
         return p;
+    }
+    void enablePlayerController() {
+        playerController = true;
+        playerGrounded = false;
+        playerVelocityY = 0.0f;
+        playerFeet = camPos - V3{0, playerEyeHeight, 0};
+        camCollide = true;
+    }
+    void updatePlayer(float dt, bool forward, bool backward, bool left, bool right,
+                      bool jump, bool fast, bool up, bool down, float yawRadians, float pitchRadians) {
+        if (!playerController || camLocked) return;
+        dt = std::clamp(dt, 0.0f, 0.1f);
+        float cp = playerGravity ? 1.0f : std::cos(pitchRadians);
+        V3 fwd{std::sin(yawRadians) * cp, playerGravity ? 0.0f : std::sin(pitchRadians),
+               -std::cos(yawRadians) * cp};
+        V3 side{std::cos(yawRadians), 0, std::sin(yawRadians)};
+        V3 wish{0, 0, 0};
+        if (forward) wish = wish + fwd;
+        if (backward) wish = wish - fwd;
+        if (right) wish = wish + side;
+        if (left) wish = wish - side;
+        float wishLength = length(wish);
+        if (wishLength > 0) wish = wish * (1.0f / wishLength);
+        float speed = playerSpeed * (fast ? 1.8f : 1.0f);
+        V3 target = playerFeet + wish * (speed * dt);
+        if (playerGravity) {
+            if (jump && playerGrounded) {
+                playerVelocityY = playerJumpSpeed;
+                playerGrounded = false;
+            }
+            playerVelocityY -= 18.0f * dt;
+            target.y += playerVelocityY * dt;
+        } else {
+            playerVelocityY = 0.0f;
+            playerGrounded = false;
+            target.y += (float(up) - float(down)) * speed * dt;
+        }
+
+        std::vector<OBB> boxes;
+        for (const Object& o : objects) if (o.collide) boxes.push_back(colliderOf(o));
+        int steps = std::min(64, std::max(1, (int)std::ceil(length(target - playerFeet) / (playerRadius * 0.5f))));
+        V3 feet = playerFeet;
+        bool hitGround = false;
+        for (int i = 1; i <= steps; ++i) {
+            V3 next = playerFeet + (target - playerFeet) * (float(i) / float(steps));
+            V3 resolved = resolvePlayer(boxes, feet, next);
+            if (playerVelocityY < 0 && resolved.y > next.y + 1e-4f) hitGround = true;
+            feet = resolved;
+        }
+        playerFeet = feet;
+        if (hitGround) playerVelocityY = 0.0f;
+        playerGrounded = hitGround;
+        camPos = playerFeet + V3{0, playerEyeHeight, 0};
     }
     std::string resolve(const std::string& p) const {
         namespace fs = std::filesystem;
@@ -528,7 +631,8 @@ struct Scene {
     bool dummy = false;
     V3 bmin{1e30f, 1e30f, 1e30f}, bmax{-1e30f, -1e30f, -1e30f};
 
-    void addTri(V3 a, V3 b, V3 c, V3 albedo, V3 emission, const float uv[3][2], int layer, float footprint) {
+    void addTri(V3 a, V3 b, V3 c, V3 albedo, V3 emission, const float uv[3][2], int layer, float footprint,
+                uint32_t wrapMode = 0u, uint32_t filterMode = 0u) {
         if (tris.size() >= MAX_TRIS) { truncated = true; return; }
         GpuTri t{};
         auto set4 = [](float* d, V3 v) { d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = 0; };
@@ -547,10 +651,13 @@ struct Scene {
                 if (cacheTexels + n > CACHE_MAX_TEXELS) { k = 1; n = 1; }          // out of budget: coarsest cell
                 if (cacheTexels + n > CACHE_MAX_TEXELS) { k = 0; n = 0; }          // truly full: not cached
             }
-            t.cache[0] = cacheTexels; t.cache[1] = k; t.cache[2] = t.cache[3] = 0;
+            t.cache[0] = cacheTexels; t.cache[1] = k;
+            t.cache[2] = wrapMode; t.cache[3] = filterMode;
             cacheOffsets.push_back(cacheTexels);
             cacheTexels += n;
             layoutHash = (layoutHash ^ k) * 1099511628211ull;
+            layoutHash = (layoutHash ^ wrapMode) * 1099511628211ull;
+            layoutHash = (layoutHash ^ filterMode) * 1099511628211ull;
             if (!dummy)
                 for (V3 v : {a, b, c}) {
                     bmin = {std::min(bmin.x, v.x), std::min(bmin.y, v.y), std::min(bmin.z, v.z)};
@@ -558,19 +665,19 @@ struct Scene {
                 }
         }
         bool emissive = emission.x > 0 || emission.y > 0 || emission.z > 0;
-if (emissive && lights.size() < MAX_LIGHTS) {
-    V3    cr       = cross(b - a, c - a);
-    float area     = 0.5f * length(cr);
-    V3    centroid = (a + b + c) * (1.0f / 3.0f);
-    float r2       = std::max({length(a - centroid), length(b - centroid), length(c - centroid)});
-    GpuLight L{};
-    setF3(L.pos, centroid);
-    L.radius = std::max(r2, 1e-3f);            // circumradius: actually bounds the triangle
-    setF3(L.dir, normalize(cr));
-    L.type = LIGHT_TRI; setF3(L.color, emission); L.range = 1e9f;
-    L.tri = (uint32_t)tris.size(); L.power = lum(emission) * area;
-    if (L.power > 0) lights.push_back(L);
-}
+        if (emissive && lights.size() < MAX_LIGHTS) {
+            V3    cr       = cross(b - a, c - a);
+            float area     = 0.5f * length(cr);
+            V3    centroid = (a + b + c) * (1.0f / 3.0f);
+            float r2       = std::max({length(a - centroid), length(b - centroid), length(c - centroid)});
+            GpuLight L{};
+            setF3(L.pos, centroid);
+            L.radius = std::max(r2, 1e-3f);            // circumradius: actually bounds the triangle
+            setF3(L.dir, normalize(cr));
+            L.type = LIGHT_TRI; setF3(L.color, emission); L.range = 1e9f;
+            L.tri = (uint32_t)tris.size(); L.power = lum(emission) * area;
+            if (L.power > 0) lights.push_back(L);
+        }
         tris.push_back(t);
         for (V3 v : {a, b, c}) { verts.push_back(v.x); verts.push_back(v.y); verts.push_back(v.z); }
     }
@@ -578,6 +685,7 @@ if (emissive && lights.size() < MAX_LIGHTS) {
 
 inline void buildScene(const World& w, Scene& s) {
     for (const Object& o : w.objects) {
+        if (o.collisionOnly) continue;
         const Mesh& m = w.meshes[o.mesh];
         bool emissive = o.emit.x > 0 || o.emit.y > 0 || o.emit.z > 0;
         bool emitOn = emissive && w.areaLights;        // area lights switched off: panels stay as black geometry
@@ -594,7 +702,8 @@ inline void buildScene(const World& w, Scene& s) {
             float worldArea = 0.5f * length(cross(q[1] - q[0], q[2] - q[0]));
             float uvArea = 0.5f * std::fabs((uv[1][0] - uv[0][0]) * (uv[2][1] - uv[0][1]) - (uv[2][0] - uv[0][0]) * (uv[1][1] - uv[0][1]));
             float footprint = worldArea > 1e-12f ? std::sqrt(uvArea / worldArea) : 0.0f;
-            s.addTri(q[0], q[1], q[2], albedo, emitOn ? o.emit : V3{0, 0, 0}, uv, layer, footprint);
+            s.addTri(q[0], q[1], q[2], albedo, emitOn ? o.emit : V3{0, 0, 0}, uv, layer, footprint,
+                     o.texClamp ? 1u : 0u, o.texNearest ? 1u : 0u);
         }
     }
     for (const LightDef& d : w.lights) {
@@ -877,8 +986,26 @@ private:
                 it = w.modelByKey.find(key);
             }
             w.meshIndex[t[1]] = it->second;
+        } else if (c == "collider") {
+            if (!need(t, 2, ln, "collider <name> [pos x y z] [rot x y z] [size x y z]")) return;
+            Object o;
+            o.mesh = w.meshIndex.at("cube");
+            o.name = t[1];
+            o.collisionOnly = true;
+            bool valid = true;
+            for (size_t i = 2; i < t.size();) {
+                const std::string& k = t[i];
+                if (k == "pos" && i + 3 < t.size()) { o.pos = vec3(t, i + 1, ln); i += 4; }
+                else if (k == "rot" && i + 3 < t.size()) { o.rot = vec3(t, i + 1, ln); i += 4; }
+                else if (k == "size" && i + 3 < t.size()) { o.size = vec3(t, i + 1, ln); i += 4; }
+                else { err(ln, "bad collider option '" + k + "'"); valid = false; break; }
+            }
+            if (!valid) return;
+            destroy(o.name);
+            w.objects.push_back(o);
+            w.dirty = true;
         } else if (c == "spawn") {
-            if (!need(t, 3, ln, "spawn <name> <mesh> [pos x y z] [rot x y z] [size x y z|scale s] [color r g b] [tex id] [uvscale s] [emit r g b]")) return;
+            if (!need(t, 3, ln, "spawn <name> <mesh> [pos x y z] [rot x y z] [size x y z|scale s] [color r g b] [tex id] [uvscale s] [wrap repeat|clamp] [filter linear|nearest] [emit r g b]")) return;
             auto mi = w.meshIndex.find(t[2]);
             if (mi == w.meshIndex.end()) { err(ln, "unknown mesh '" + t[2] + "' (cube, quad, sphere, or a model id)"); return; }
             Object o;
@@ -895,6 +1022,18 @@ private:
                 else if (k == "color" && i + 3 < t.size()) { o.color = vec3(t, i + 1, ln); colorSet = true; i += 4; }
                 else if (k == "emit" && i + 3 < t.size()) { o.emit = vec3(t, i + 1, ln); i += 4; }
                 else if (k == "uvscale" && i + 1 < t.size()) { o.uvscale = num(t[i + 1], ln); i += 2; }
+                else if (k == "wrap" && i + 1 < t.size()) {
+                    if (t[i + 1] == "repeat") o.texClamp = false;
+                    else if (t[i + 1] == "clamp") o.texClamp = true;
+                    else err(ln, "texture wrap must be repeat or clamp");
+                    i += 2;
+                }
+                else if (k == "filter" && i + 1 < t.size()) {
+                    if (t[i + 1] == "linear") o.texNearest = false;
+                    else if (t[i + 1] == "nearest") o.texNearest = true;
+                    else err(ln, "texture filter must be linear or nearest");
+                    i += 2;
+                }
                 else if (k == "collide" && i + 1 < t.size()) { o.collide = isOn(t[i + 1]); i += 2; }
                 else if (k == "tex" && i + 1 < t.size()) {
                     auto ti = w.texIds.find(t[i + 1]);
@@ -921,6 +1060,16 @@ private:
                 else if (p == "color" && t.size() >= 6) o->color = vec3(t, 3, ln);
                 else if (p == "emit" && t.size() >= 6) o->emit = vec3(t, 3, ln);
                 else if (p == "uvscale") o->uvscale = num(t[3], ln);
+                else if (p == "wrap") {
+                    if (t[3] == "repeat") o->texClamp = false;
+                    else if (t[3] == "clamp") o->texClamp = true;
+                    else err(ln, "texture wrap must be repeat or clamp");
+                }
+                else if (p == "filter") {
+                    if (t[3] == "linear") o->texNearest = false;
+                    else if (t[3] == "nearest") o->texNearest = true;
+                    else err(ln, "texture filter must be linear or nearest");
+                }
                 else if (p == "collide") o->collide = isOn(t[3]);
                 else if (p == "tex") {
                     if (t[3] == "none") o->tex = -1;
@@ -965,7 +1114,11 @@ private:
             w.dirty = true;
         } else if (c == "camera") {
             if (!need(t, 3, ln, "camera pos x y z | camera look yaw pitch | camera lock on|off")) return;
-            if (t[1] == "pos" && t.size() >= 5) { w.camPos = vec3(t, 2, ln); w.camChanged = true; }
+            if (t[1] == "pos" && t.size() >= 5) {
+                w.camPos = vec3(t, 2, ln);
+                if (w.playerController) w.playerFeet = w.camPos - V3{0, w.playerEyeHeight, 0};
+                w.camChanged = true;
+            }
             else if (t[1] == "look" && t.size() >= 4) { w.camYaw = num(t[2], ln); w.camPitch = num(t[3], ln); w.camChanged = true; }
             else if (t[1] == "lock" && t.size() >= 3) { w.camLocked = isOn(t[2]); }
             else err(ln, "usage: camera pos x y z | camera look yaw pitch | camera lock on|off");
@@ -995,10 +1148,36 @@ private:
             w.areaLights = (t[1] == "on" || t[1] == "1" || t[1] == "true");
             w.dirty = true;
         } else if (c == "denoise") {
-            if (!need(t, 2, ln, "denoise on|off|<strength 0..4>")) return;
+            if (!need(t, 2, ln, "denoise on|off|<value 0..4>")) return;
             if (t[1] == "on") w.denoise = 1.0f;
             else if (t[1] == "off") w.denoise = 0.0f;
             else w.denoise = std::clamp(num(t[1], ln), 0.0f, 4.0f);
+        } else if (c == "dlss") {
+            if (!need(t, 2, ln, "dlss off|quality|balanced|performance|ultra-performance|ultra-quality")) return;
+            if (t[1] == "off") w.dlssMode = 0;
+            else if (t[1] == "quality") w.dlssMode = 1;
+            else if (t[1] == "balanced") w.dlssMode = 2;
+            else if (t[1] == "performance") w.dlssMode = 3;
+            else if (t[1] == "ultra-performance") w.dlssMode = 4;
+            else if (t[1] == "ultra-quality") w.dlssMode = 5;
+            else err(ln, "usage: dlss off|quality|balanced|performance|ultra-performance|ultra-quality");
+        } else if (c == "sky") {
+            if (!need(t, 2, ln, "sky gradient <zr zg zb> <hr hg hb> | sky color r g b | sky intensity v | sky off")) return;
+            if (t[1] == "gradient" && t.size() >= 8) {
+                w.skyZenith  = vec3(t, 2, ln);
+                w.skyHorizon = vec3(t, 5, ln);
+            } else if (t[1] == "color" && t.size() >= 5) {
+                V3 col = vec3(t, 2, ln);
+                w.skyZenith  = col;
+                w.skyHorizon = col;
+            } else if (t[1] == "intensity" && t.size() >= 3) {
+                w.skyIntensity = std::max(0.0f, num(t[2], ln));
+            } else if (t[1] == "off") {
+                w.skyIntensity = 0.0f;
+            } else {
+                err(ln, "usage: sky gradient <zr zg zb> <hr hg hb> | sky color r g b | sky intensity v | sky off");
+            }
+            // NOTE: do NOT set w.dirty — the sky is not geometry, so no BLAS/TLAS rebuild is needed.
         } else if (c == "collision") {
             if (!need(t, 3, ln, "collision camera on|off [radius] | collision <name|prefix*> on|off")) return;
             if (t[1] == "camera") {
@@ -1010,15 +1189,45 @@ private:
                 if (!hit) err(ln, "no object matches '" + t[1] + "'");
             }
         } else if (c == "gi") {
-            if (!need(t, 2, ln, "gi path|cache|screen | gi rate 1|2 | gi cellsize v")) return;
+            if (!need(t, 2, ln, "gi path|cache|screen | gi rate 1|2 | gi offscreen n | gi cellsize v")) return;
             if (t[1] == "path") w.giMode = 0;
             else if (t[1] == "cache") w.giMode = 1;
             else if (t[1] == "screen") w.giMode = 2;
             else if (t[1] == "rate" && t.size() > 2) w.giRate = num(t[2], ln) >= 2 ? 2 : 1;
+            else if (t[1] == "offscreen" && t.size() > 2)
+                w.giOffscreenRate = static_cast<uint32_t>(std::clamp(num(t[2], ln), 1.0f, 64.0f) + 0.5f);
             else if (t[1] == "cellsize" && t.size() > 2) { w.cacheCellSize = std::max(0.05f, num(t[2], ln)); w.dirty = true; }
-            else err(ln, "usage: gi path|cache|screen | gi rate 1|2 | gi cellsize v");
+            else err(ln, "usage: gi path|cache|screen | gi rate 1|2 | gi offscreen n | gi cellsize v");
+        } else if (c == "shader") {
+    if (!need(t, 3, ln, "shader <id> <file> [stage gbuffer|post] [groups x y z] [manual] | shader <id> on|off|run | shader <id> param <slot> <value>")) return;
+    CustomShader* s = nullptr;
+    for (auto& x : w.shaders) if (x.id == t[1]) s = &x;
+    const std::string& sub = t[2];
+    if (sub == "on" || sub == "off" || sub == "run" || sub == "param") {
+        if (!s) { err(ln, "no shader named '" + t[1] + "'"); return; }
+        if (sub == "on") s->enabled = true;
+        else if (sub == "off") s->enabled = false;
+        else if (sub == "run") ++s->runOnce;
+        else {
+            if (!need(t, 5, ln, "shader <id> param <slot 0..15> <value>")) return;
+            int slot = (int)num(t[3], ln);
+            if (slot < 0 || slot > 15) { err(ln, "param slot must be 0..15"); return; }
+            s->pc[slot] = num(t[4], ln);
+        }
+    } else {
+        CustomShader d;
+        d.id = t[1]; d.path = w.resolve(sub);
+        if (!std::filesystem::exists(d.path)) { err(ln, "cannot find shader file '" + sub + "'"); return; }
+        for (size_t i = 3; i < t.size();) {
+            if (t[i] == "stage" && i + 1 < t.size()) { d.stage = t[i + 1] == "gbuffer" ? 0 : 1; i += 2; }
+            else if (t[i] == "groups" && i + 3 < t.size()) { d.customGroups = true; for (int k = 0; k < 3; ++k) d.groups[k] = (uint32_t)std::max(1.0f, num(t[i + 1 + k], ln)); i += 4; }
+            else if (t[i] == "manual") { d.enabled = false; ++i; }
+            else { err(ln, "bad shader option '" + t[i] + "'"); ++i; }
+        }
+        if (s) { d.pc[0] = 0; *s = d; } else w.shaders.push_back(d);
+    }
         } else if (c == "builtin") {
-            if (!need(t, 2, ln, "builtin cornell|pointlights [N]|spots|sun")) return;
+            if (!need(t, 2, ln, "builtin cornell|pointlights [N]|spots|sun|player [height] [gravity on|off]")) return;
             builtin(t, ln);
         } else {
             err(ln, "unknown command '" + c + "'");
@@ -1026,7 +1235,35 @@ private:
     }
 
     void builtin(const std::vector<std::string>& t, int ln) {
-        if (t[1] == "cornell") {
+        if (t[1] == "player") {
+            bool hasHeight = false;
+            for (size_t i = 2; i < t.size();) {
+                if (t[i] == "gravity" && i + 1 < t.size()) {
+                    if (t[i + 1] != "on" && t[i + 1] != "off") {
+                        err(ln, "player gravity must be on or off");
+                        return;
+                    }
+                    w.playerGravity = isOn(t[i + 1]);
+                    w.playerVelocityY = 0.0f;
+                    w.playerGrounded = false;
+                    i += 2;
+                } else if (!hasHeight) {
+                    float height = num(t[i], ln);
+                    if (!(height > 2.0f * w.playerRadius)) {
+                        err(ln, "player height must be greater than twice the player radius");
+                        return;
+                    }
+                    w.playerHeight = height;
+                    w.playerEyeHeight = height * 0.9f;
+                    hasHeight = true;
+                    ++i;
+                } else {
+                    err(ln, "usage: builtin player [height] [gravity on|off]");
+                    return;
+                }
+            }
+            w.enablePlayerController();
+        } else if (t[1] == "cornell") {
             execLine("spawn cornell_floor quad pos 0 0 0 size 5 1 5");
             execLine("spawn cornell_ceiling quad pos 0 5 0 rot 180 0 0 size 5 1 5");
             execLine("spawn cornell_back quad pos 0 2.5 -2.5 rot 90 0 0 size 5 1 5");
@@ -1075,6 +1312,6 @@ private:
             w.dirty = true;
         } else if (t[1] == "sun") {
             execLine("light sun sun 0.25 -0.45 -1.0 2.0 1.9 1.7 0.5");
-        } else err(ln, "builtin must be cornell, pointlights, spots or sun");
+        } else err(ln, "builtin must be cornell, pointlights, spots, sun or player");
     }
 };

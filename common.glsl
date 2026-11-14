@@ -22,7 +22,10 @@ layout(set = 0, binding = 1, std140) uniform FrameUBO {
     uvec4 gridDim;     // world light grid: cells per axis
     uvec4 misc3;   // x=giMode (0 path, 1 cache, 2 cache+screen) y=giRate z=cache radiosity rays w=unused
     uvec4 misc4;   // x=cacheBudget y=cacheCursor z=cacheEntries (texels*2 sides) w=numTris
-    vec4  params3; // x=screenTraceDist y=cacheMaxHistory z=denoiseStrength (0 = off)
+        vec4  params3; // x=screenTraceDist y=cacheMaxHistory z=denoiseStrength (0 = off)
+    vec4  skyZenith;   // rgb = sky radiance at dir.y = +1 (already scaled by intensity)
+    vec4  skyHorizon;  // rgb = sky radiance at dir.y <= 0
+        vec4  jitter;      // xy=current pixel jitter, zw=previous pixel jitter
 } U;
 
 struct Tri {
@@ -104,10 +107,16 @@ float rnd(inout uint s) {
 
 float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 
+vec3 skyRadiance(vec3 dir) {
+    float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+    return mix(U.skyHorizon.xyz, U.skyZenith.xyz, t);
+}
+
 // ---------------------------------------------------------------- camera
 vec3 primaryDir(uvec2 px) {
-    vec2 ndc = vec2(2.0 * (float(px.x) + 0.5) / float(U.misc0.x) - 1.0,
-                    1.0 - 2.0 * (float(px.y) + 0.5) / float(U.misc0.y));
+    vec2 samplePx = vec2(px) + vec2(0.5) + U.jitter.xy;
+    vec2 ndc = vec2(2.0 * samplePx.x / float(U.misc0.x) - 1.0,
+                    1.0 - 2.0 * samplePx.y / float(U.misc0.y));
     return normalize(U.camFwd.xyz + ndc.x * U.camRight.xyz + ndc.y * U.camUp.xyz);
 }
 vec3 worldPos(uvec2 px, float t) { return U.camPos.xyz + primaryDir(px) * t; }
@@ -121,7 +130,7 @@ bool reproject(vec3 p, out ivec2 pp) {
     vec2 ndc = vec2(dot(v, U.prevRight.xyz) / (z * dot(U.prevRight.xyz, U.prevRight.xyz)),
                     dot(v, U.prevUp.xyz)    / (z * dot(U.prevUp.xyz,    U.prevUp.xyz)));
     vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-    pp = ivec2(floor(uv * vec2(U.misc0.xy)));
+    pp = ivec2(floor(uv * vec2(U.misc0.xy) - U.jitter.zw));
     return all(greaterThanEqual(pp, ivec2(0))) && all(lessThan(pp, ivec2(U.misc0.xy)));
 }
 
@@ -129,12 +138,14 @@ bool reproject(vec3 p, out ivec2 pp) {
 bool historyValid(ivec2 pp, vec3 p, vec3 n) {
     vec4 pnd = imageLoad(gNDPrev, pp);
     if (pnd.w <= 0.0) return false;
-    vec2 ndc = vec2(2.0 * (float(pp.x) + 0.5) / float(U.misc0.x) - 1.0,
-                    1.0 - 2.0 * (float(pp.y) + 0.5) / float(U.misc0.y));
+    vec2 previousPx = vec2(pp) + vec2(0.5) + U.jitter.zw;
+    vec2 ndc = vec2(2.0 * previousPx.x / float(U.misc0.x) - 1.0,
+                    1.0 - 2.0 * previousPx.y / float(U.misc0.y));
     vec3 pd = normalize(U.prevFwd.xyz + ndc.x * U.prevRight.xyz + ndc.y * U.prevUp.xyz);
     vec3 pPrev = U.prevPos.xyz + pd * pnd.w;                 // previous surface point
     float dist = length(p - U.prevPos.xyz);
-    return abs(dot(p - pPrev, n)) < 0.02 * dist && dot(pnd.xyz, n) > 0.9;
+    float depthTolerance = max(4.0 * RAY_EPS, dist * U.params2.w);
+    return abs(dot(p - pPrev, n)) < depthTolerance && dot(pnd.xyz, n) > 0.9;
 }
 
 // ---------------------------------------------------------------- ray queries

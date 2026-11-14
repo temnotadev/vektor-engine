@@ -1,0 +1,60 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly  image2D uInputIrradiance;
+layout(set = 0, binding = 1, rgba16f) uniform readonly  image2D uNormalDepth; // xyz = world normal, w = linear depth
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D uOutputIrradiance;
+
+layout(push_constant) uniform PushConstants {
+    int stepSize; // 1, 2, 4, 8
+    float phiColor;  // e.g., 0.5 to 1.5
+    float phiNormal; // e.g., 128.0
+    float phiDepth;  // e.g., 0.02
+} pc;
+
+// 5x5 B3-spline kernel weights
+const float kernel[5] = float[5](1.0/16.0, 1.0/4.0, 3.0/8.0, 1.0/4.0, 1.0/16.0);
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uInputIrradiance);
+    if (coord.x >= size.x || coord.y >= size.y) return;
+
+    vec3 centerColor  = imageLoad(uInputIrradiance, coord).rgb;
+    vec4 centerND     = imageLoad(uNormalDepth, coord);
+    vec3 centerNormal = centerND.xyz;
+    float centerDepth = centerND.w;
+
+    vec3 sumColor   = vec3(0.0);
+    float sumWeight = 0.0;
+
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            ivec2 sampleCoord = clamp(coord + ivec2(x, y) * pc.stepSize, ivec2(0), size - 1);
+
+            vec3 sampleColor  = imageLoad(uInputIrradiance, sampleCoord).rgb;
+            vec4 sampleND     = imageLoad(uNormalDepth, sampleCoord);
+            vec3 sampleNormal = sampleND.xyz;
+            float sampleDepth = sampleND.w;
+
+            // 1. Color / Luminance edge-stopping weight
+            vec3 diffColor = centerColor - sampleColor;
+            float distColor = dot(diffColor, diffColor);
+            float wColor = exp(-distColor / max(pc.phiColor, 1e-5));
+
+            // 2. Normal edge-stopping weight (keeps box corners sharp)
+            float wNormal = pow(max(0.0, dot(centerNormal, sampleNormal)), pc.phiNormal);
+
+            // 3. Depth edge-stopping weight (prevents bleeding across objects)
+            float distDepth = abs(centerDepth - sampleDepth);
+            float wDepth = exp(-distDepth / max(pc.phiDepth * float(pc.stepSize), 1e-5));
+
+            float weight = kernel[x + 2] * kernel[y + 2] * wColor * wNormal * wDepth;
+            sumColor  += sampleColor * weight;
+            sumWeight += weight;
+        }
+    }
+
+    vec3 result = sumColor / max(sumWeight, 1e-5);
+    imageStore(uOutputIrradiance, coord, vec4(result, 1.0));
+}

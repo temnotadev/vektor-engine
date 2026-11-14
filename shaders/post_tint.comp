@@ -1,0 +1,17 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform UserPC { vec4 p[4]; } PC;   // slot n = p[n/4][n%4]
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, U.misc0.xy))) return;
+    ivec2 ip = ivec2(px);
+    vec3 c = imageLoad(finalImg, ip).rgb;
+    vec2 uv = (vec2(px) + 0.5) / vec2(U.misc0.xy);
+    c *= mix(1.0, smoothstep(0.9, 0.3, length(uv - 0.5)), 0.8);   // vignette
+    c *= 0.92 + 0.08 * sin(PC.p[0].x * 3.0);                      // pulse driven by slot 0 ($time)
+    imageStore(finalImg, ip, vec4(c, 1.0));
+}

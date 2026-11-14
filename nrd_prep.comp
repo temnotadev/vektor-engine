@@ -1,0 +1,63 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 26, rgba16f) uniform image2D nrdRawDI;
+layout(set = 0, binding = 27, rgba16f) uniform image2D nrdRawGI;
+layout(set = 0, binding = 28, rgba16f) uniform image2D nrdDIInput;
+layout(set = 0, binding = 29, rgba16f) uniform image2D nrdGIInput;
+layout(set = 0, binding = 30, rg16f) uniform image2D nrdMotion;
+layout(set = 0, binding = 31, rgb10_a2) uniform image2D nrdNormalRoughness;
+layout(set = 0, binding = 32, r32f) uniform image2D nrdViewZ;
+
+vec4 packDiffuse(vec4 signal, float viewZ) {
+    float normHitDist = clamp(signal.a / (3.0 + viewZ * 0.1), 0.0, 1.0);
+    return vec4(signal.rgb, normHitDist);
+}
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, U.misc0.xy))) return;
+    ivec2 ip = ivec2(px);
+
+    vec4 nd = imageLoad(gND, ip);
+    if (nd.w <= 0.0) {
+        imageStore(nrdViewZ, ip, vec4(60000.0));
+        imageStore(nrdNormalRoughness, ip, vec4(0.5, 0.5, 1.0, 0.0));
+        imageStore(nrdMotion, ip, vec4(0.0));
+        imageStore(nrdDIInput, ip, vec4(0.0));
+        imageStore(nrdGIInput, ip, vec4(0.0));
+        return;
+    }
+
+    vec3 rayDir = primaryDir(px);
+    float viewZ = max(dot(rayDir, U.camFwd.xyz) * nd.w, 1e-3);
+    vec3 n = normalize(nd.xyz);
+    imageStore(nrdViewZ, ip, vec4(viewZ));
+    vec3 octNormal = n / (abs(n.x) + abs(n.y) + abs(n.z));
+    float encY = octNormal.y * 0.5 + 0.5;
+    float encX = octNormal.x * 0.5 + encY;
+    encY -= octNormal.x * 0.5;
+    float signedRoughness = n.z < 0.0 ? -1.0 : 1.0;
+    float encZ = signedRoughness * 0.5 + 0.5;
+    imageStore(nrdNormalRoughness, ip, vec4(encX, encY, encZ, 0.0));
+
+    vec2 motion = vec2(0.0);
+    vec3 previousViewPosition = worldPos(px, nd.w) - U.prevPos.xyz;
+    float previousViewZ = dot(previousViewPosition, U.prevFwd.xyz);
+    if (previousViewZ > 1e-4) {
+        vec2 previousNdc = vec2(
+            dot(previousViewPosition, U.prevRight.xyz) /
+                (previousViewZ * dot(U.prevRight.xyz, U.prevRight.xyz)),
+            dot(previousViewPosition, U.prevUp.xyz) /
+                (previousViewZ * dot(U.prevUp.xyz, U.prevUp.xyz)));
+        vec2 previousUv = vec2(previousNdc.x * 0.5 + 0.5, 0.5 - previousNdc.y * 0.5);
+        vec2 currentUv = (vec2(px) + 0.5 + U.jitter.xy) / vec2(U.misc0.xy);
+        motion = previousUv - currentUv;
+    }
+    imageStore(nrdMotion, ip, vec4(motion, 0.0, 0.0));
+
+    imageStore(nrdDIInput, ip, imageLoad(nrdRawDI, ip));
+    imageStore(nrdGIInput, ip, packDiffuse(imageLoad(nrdRawGI, ip), viewZ));
+}
