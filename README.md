@@ -1,6 +1,6 @@
 
 
-![Logo](https://i.ibb.co/1t8Q3QSS/fulllogo.png)
+![Logo](logogit)
 # Vektor Engine
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
