@@ -20,5 +20,5 @@ AAA Open Source game engine inspired by UE rendering techniques like ReSTIR DI, 
 
 In shown example we loaded de_dust2 voxel scene, due to ReSTIR DI and optimized RTGI we can place magnitudes of lights. We are getting roughly 210 fps. Note that shadows are fully raytraced, with real life like quality.
 
-![Logo](Знімок екрана 2026-11-14 155809.png)
+![Logo](demo2.png)
 
