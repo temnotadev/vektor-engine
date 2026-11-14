@@ -12,7 +12,9 @@ AAA Open Source game engine inspired by UE rendering techniques like ReSTIR DI, 
 - Easy scripting language .SCR
 - Optimized Editor
 - Vulkan Crossplatform
-- NRD Denoiser
+- NRD Denoiser (Nvidia libraries need to be imported manually)
+- DLSS 4.5 (Nvidia libraries and NRD need to be imported manually)
+- Custom shader support
 
 ## Demo
 
