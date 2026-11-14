@@ -12,11 +12,11 @@ AAA Open Source game engine inspired by UE rendering techniques like ReSTIR DI, 
 - Easy scripting language .SCR
 - Optimized Editor
 - Vulkan Crossplatform
-
+- NRD Denoiser
 
 ## Demo
 
-In shown example we loaded de_dust2 voxel scene, due to ReSTIR DI and optimized RTGI we can place magnitudes of lights. We are getting roughly 280 fps. Note that shadows are fully raytraced, with real life like quality.
+In shown example we loaded de_dust2 voxel scene, due to ReSTIR DI and optimized RTGI we can place magnitudes of lights. We are getting roughly 210 fps. Note that shadows are fully raytraced, with real life like quality.
 
-![Logo](https://i.ibb.co/jPSFx2ry/image.png)
+![Logo](https://i.ibb.co/WLgxjvQ/image.png)
 
