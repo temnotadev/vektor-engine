@@ -1,6 +1,6 @@
 
 
-![Logo](repo/Frame 6.png)
+![Logo](<repo/Frame 6.png>)
 # Vektor Engine (early beta)
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
@@ -20,7 +20,7 @@ Open Source game engine inspired by UE rendering techniques like ReSTIR DI from 
 
 In shown example we loaded de_dust2 voxel scene, due to ReSTIR DI and optimized RTGI we can place magnitudes of lights. For example in our scene we placed 1000 lights (3 additional lights is directional, sky, and area emission shape in sky) we getting extremely good results in our case, remember all lights are fully dynamic with ray traced shadows and dynamic bounces.
 
-![Logo](repo/Знімок екрана 2026-11-16 181037.png)
+![Logo](<repo/Знімок екрана 2026-11-16 181037.png>)
 
 
 ## Building
