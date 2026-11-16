@@ -12,11 +12,87 @@ void main() {
 
     vec4 nd = imageLoad(gND, ip);
     Res  c  = unpackRes(imageLoad(resTCur, ip));
-    if (nd.w <= 0.0 || (U.misc0.w & 2u) == 0u) { imageStore(resSpatial, ip, packRes(c)); return; }
+    if (nd.w <= 0.0) {
+        imageStore(resSpatial, ip, packRes(emptyRes()));
+        if (U.misc2.w != 0u) imageStore(resInit, ip, packRes(emptyRes()));
+        return;
+    }
 
     vec3 n = nd.xyz;
     vec3 p = worldPos(px, nd.w);
     uint s = seedFor(px, U.misc0.z, 4u);
+
+    if (U.misc2.w != 0u) {
+        Res solarReservoir = c;
+        if ((U.misc0.w & 2u) != 0u) {
+            for (int i = 0; i < 5; ++i) {
+                float angle = 6.28318530718 * rnd(s);
+                float distance = 30.0 * sqrt(rnd(s));
+                ivec2 q = ip + ivec2(round(vec2(cos(angle), sin(angle)) * distance));
+                if (q == ip || any(lessThan(q, ivec2(0))) ||
+                    any(greaterThanEqual(q, ivec2(U.misc0.xy)))) continue;
+
+                vec4 neighborSurface = imageLoad(gND, q);
+                if (neighborSurface.w <= 0.0 || dot(neighborSurface.xyz, n) < 0.95) continue;
+
+                vec3 neighborPosition = worldPos(uvec2(q), neighborSurface.w);
+                float depthTolerance = max(4.0 * RAY_EPS,
+                    max(length(p - U.camPos.xyz), length(neighborPosition - U.camPos.xyz)) * U.params2.w);
+                if (abs(dot(neighborPosition - p, n)) > depthTolerance ||
+                    abs(dot(neighborPosition - p, neighborSurface.xyz)) > depthTolerance) continue;
+
+                Res neighborReservoir = unpackRes(imageLoad(resTCur, q));
+                if (neighborReservoir.light == NO_LIGHT || neighborReservoir.W <= 0.0 ||
+                    neighborReservoir.M <= 0.0) continue;
+
+                float neighborTargetCurrent = targetPdf(p, n, neighborReservoir.light,
+                                                        neighborReservoir.u);
+                bool haveCurrent = solarReservoir.light != NO_LIGHT &&
+                                   solarReservoir.W > 0.0 && solarReservoir.M > 0.0;
+                float currentTarget = haveCurrent
+                    ? targetPdf(p, n, solarReservoir.light, solarReservoir.u) : 0.0;
+                float neighborTargetNeighbor = targetPdf(neighborPosition, neighborSurface.xyz,
+                                                         neighborReservoir.light, neighborReservoir.u);
+                float currentTargetNeighbor = haveCurrent
+                    ? targetPdf(neighborPosition, neighborSurface.xyz, solarReservoir.light,
+                                solarReservoir.u) : 0.0;
+
+                float currentWeight = haveCurrent ? currentTarget * solarReservoir.W : 0.0;
+                float neighborWeight = neighborTargetCurrent * neighborReservoir.W;
+                if (haveCurrent) {
+                    currentWeight *= balanceHeuristic(solarReservoir.M * currentTarget,
+                                                       neighborReservoir.M * currentTargetNeighbor);
+                    neighborWeight *= balanceHeuristic(neighborReservoir.M * neighborTargetNeighbor,
+                                                       solarReservoir.M * neighborTargetCurrent);
+                }
+
+                float weightSum = currentWeight + neighborWeight;
+                if (weightSum <= 0.0) continue;
+                if (rnd(s) * weightSum < neighborWeight) {
+                    solarReservoir.light = neighborReservoir.light;
+                    solarReservoir.u = neighborReservoir.u;
+                    solarReservoir.W = weightSum / neighborTargetCurrent;
+                } else {
+                    solarReservoir.W = weightSum / currentTarget;
+                }
+                solarReservoir.M = (haveCurrent ? solarReservoir.M : 0.0) +
+                                   neighborReservoir.M;
+            }
+        }
+
+        Res historyReservoir = solarReservoir;
+        if (solarReservoir.light != NO_LIGHT && solarReservoir.W > 0.0) {
+            LightEval selectedLight = evalLight(solarReservoir.light, solarReservoir.u, p, n);
+            if (occluded(p + n * RAY_EPS, selectedLight.wi, selectedLight.dist - 2.0 * RAY_EPS)) {
+                solarReservoir.W = 0.0;
+            }
+        }
+        imageStore(resInit, ip, packRes(historyReservoir));
+        imageStore(resSpatial, ip, packRes(solarReservoir));
+        return;
+    }
+
+    if ((U.misc0.w & 2u) == 0u) { imageStore(resSpatial, ip, packRes(c)); return; }
 
     float wsum = 0.0, selP = 0.0, M = 0.0;
     uint  selTri = NO_LIGHT;

@@ -48,6 +48,7 @@ struct Light {
     vec3 dir; uint  type;
     vec3 color; float range;
     float cosOuter; float cosInner; uint tri; float power;   
+    uint strictAttenuation; uint pad0; uint pad1; uint pad2;
 };
 layout(set = 0, binding = 3, std430) readonly buffer LightBuf { Light lights[]; };
 
@@ -146,6 +147,14 @@ bool historyValid(ivec2 pp, vec3 p, vec3 n) {
     float dist = length(p - U.prevPos.xyz);
     float depthTolerance = max(4.0 * RAY_EPS, dist * U.params2.w);
     return abs(dot(p - pPrev, n)) < depthTolerance && dot(pnd.xyz, n) > 0.9;
+}
+
+vec3 previousWorldPos(ivec2 px, float t) {
+    vec2 samplePx = vec2(px) + vec2(0.5) + U.jitter.zw;
+    vec2 ndc = vec2(2.0 * samplePx.x / float(U.misc0.x) - 1.0,
+                    1.0 - 2.0 * samplePx.y / float(U.misc0.y));
+    vec3 dir = normalize(U.prevFwd.xyz + ndc.x * U.prevRight.xyz + ndc.y * U.prevUp.xyz);
+    return U.prevPos.xyz + dir * t;
 }
 
 
@@ -251,9 +260,14 @@ LightEval evalLight(uint li, vec2 u, vec3 p, vec3 n) {
 
     float atten = 1.0;
     if (L.type != LIGHT_TRI) {
-        float rr = d2 / (L.range * L.range);
-        atten = clamp(1.0 - rr * rr, 0.0, 1.0);
-        atten *= atten;                                       
+        if (L.type == LIGHT_POINT && L.strictAttenuation != 0u) {
+            vec3 centerDelta = p - L.pos;
+            atten = dot(centerDelta, centerDelta) < L.range * L.range ? 1.0 : 0.0;
+        } else {
+            float rr = d2 / (L.range * L.range);
+            atten = clamp(1.0 - rr * rr, 0.0, 1.0);
+            atten *= atten;                                       
+        }
         if (L.type == LIGHT_SPOT)
             atten *= smoothstep(L.cosOuter, L.cosInner, dot(L.dir, normalize(p - L.pos)));
     }
@@ -422,6 +436,11 @@ void resUpdate(inout float wsum, inout uint selTri, inout vec2 selB, inout float
                uint li, vec2 u, float ph, float w, inout uint s) {
     wsum += w;
     if (w > 0.0 && rnd(s) * wsum < w) { selTri = li; selB = u; selP = ph; }
+}
+
+float balanceHeuristic(float a, float b) {
+    float sum = a + b;
+    return sum > 0.0 ? a / sum : 0.0;
 }
 
 

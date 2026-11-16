@@ -66,7 +66,9 @@ struct GpuLight {
     float dir[3]; uint32_t type;
     float color[3]; float range;
     float cosOuter, cosInner; uint32_t tri; float power;
+    uint32_t strictAttenuation, pad0, pad1, pad2;
 };
+static_assert(sizeof(GpuLight) == 80, "GpuLight must match the std430 Light struct in common.glsl");
 inline void setF3(float* d, V3 v) { d[0] = v.x; d[1] = v.y; d[2] = v.z; }
 
 
@@ -99,6 +101,7 @@ struct LightDef {
     std::string name; uint32_t type = LIGHT_POINT;
     V3 pos{0, 0, 0}, dir{0, -1, 0}, color{1, 1, 1};
     float radius = 0.03f, range = 5.0f, inner = 20.0f, outer = 35.0f;   
+    bool strictAttenuation = false;
 };
 struct TexUpload { uint32_t layer; std::vector<uint8_t> data; };   
 
@@ -670,6 +673,7 @@ inline void buildScene(const World& w, Scene& s) {
         setF3(L.pos, d.pos); L.radius = std::max(d.radius, 0.001f); setF3(L.dir, normalize(d.dir));
         L.type = d.type; setF3(L.color, d.color); L.range = std::max(d.range, 0.01f);
         L.power = lum(d.color);
+        L.strictAttenuation = d.strictAttenuation ? 1u : 0u;
         if (d.type == LIGHT_SPOT) { L.cosOuter = std::cos(d.outer * kPi / 180); L.cosInner = std::cos(d.inner * kPi / 180); }
         if (d.type == LIGHT_DIR)  { L.cosOuter = std::cos(d.outer * kPi / 180); L.range = 1e9f; }
         if (L.power > 0) s.lights.push_back(L);
@@ -1040,6 +1044,10 @@ private:
                 else if (p == "color" && t.size() >= 6) l->color = vec3(t, 3, ln);
                 else if (p == "range") l->range = num(t[3], ln);
                 else if (p == "radius") l->radius = num(t[3], ln);
+                else if (p == "strict" && l->type == LIGHT_POINT) {
+                    if (t[3] != "on" && t[3] != "off") { err(ln, "light strict must be on or off"); return; }
+                    l->strictAttenuation = isOn(t[3]);
+                }
                 else err(ln, "bad property '" + p + "' for a light");
                 w.dirty = true;
             } else err(ln, "no object or light named '" + t[1] + "'");
@@ -1055,9 +1063,13 @@ private:
             l.name = t[2];
             if (!l.name.empty() && l.name.back() == '#') l.name = l.name.substr(0, l.name.size() - 1) + std::to_string(++w.spawnCounter);
             if (t[1] == "point") {
-                if (!need(t, 10, ln, "light point <name> x y z r g b range [radius]")) return;
+                if (!need(t, 10, ln, "light point <name> x y z r g b range [radius] [strict]")) return;
                 l.type = LIGHT_POINT; l.pos = vec3(t, 3, ln); l.color = vec3(t, 6, ln); l.range = num(t[9], ln);
-                if (t.size() > 10) l.radius = num(t[10], ln);
+                for (size_t i = 10; i < t.size(); ++i) {
+                    if (t[i] == "strict") l.strictAttenuation = true;
+                    else if (i == 10) l.radius = num(t[i], ln);
+                    else { err(ln, "point light option must be a radius or strict"); return; }
+                }
             } else if (t[1] == "spot") {
                 if (!need(t, 14, ln, "light spot <name> x y z dx dy dz r g b range outerDeg innerDeg [radius]")) return;
                 l.type = LIGHT_SPOT; l.pos = vec3(t, 3, ln); l.dir = vec3(t, 6, ln); l.color = vec3(t, 9, ln);

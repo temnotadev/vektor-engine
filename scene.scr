@@ -1,6 +1,6 @@
 #main scene thing
 
-builtin pointlights 1
+builtin pointlights 10
 
 gi screen
 gi offscreen 4

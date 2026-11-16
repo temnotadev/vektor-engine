@@ -17,6 +17,70 @@ void main() {
     vec3 p = worldPos(px, nd.w);
     uint s = seedFor(px, U.misc0.z, 3u);
 
+    if (U.misc2.w != 0u) {
+        float wsumSolar = 0.0, selectedTargetSolar = 0.0, confidenceSolar = 0.0;
+        uint selectedLightSolar = NO_LIGHT;
+        vec2 selectedUSolar = vec2(0.0);
+
+        ivec2 previousPixel;
+        Res previousReservoir = emptyRes();
+        vec3 previousPosition = vec3(0.0), previousNormal = vec3(0.0);
+        bool havePrevious = (U.misc0.w & 1u) != 0u && U.misc0.z > 0u &&
+                            reproject(p, previousPixel) && historyValid(previousPixel, p, n);
+        if (havePrevious) {
+            vec4 previousSurface = imageLoad(gNDPrev, previousPixel);
+            previousPosition = previousWorldPos(previousPixel, previousSurface.w);
+            previousNormal = previousSurface.xyz;
+            previousReservoir = unpackRes(imageLoad(resTPrev, previousPixel));
+            if (badf(previousReservoir.W) || badf(previousReservoir.M)) {
+                previousReservoir = emptyRes();
+            }
+            previousReservoir.M = min(previousReservoir.M, 20.0);
+            havePrevious = previousReservoir.light != NO_LIGHT &&
+                           previousReservoir.W > 0.0 && previousReservoir.M > 0.0;
+        }
+
+        bool haveCurrent = cur.light != NO_LIGHT && cur.W > 0.0 && cur.M > 0.0;
+        float currentTarget = haveCurrent ? targetPdf(p, n, cur.light, cur.u) : 0.0;
+        float previousTargetCurrent = havePrevious
+            ? targetPdf(p, n, previousReservoir.light, previousReservoir.u) : 0.0;
+
+        float currentWeight = currentTarget * cur.W;
+        float previousWeight = previousTargetCurrent * previousReservoir.W;
+        if (havePrevious && haveCurrent) {
+            float currentTargetPrevious = targetPdf(previousPosition, previousNormal, cur.light, cur.u);
+            float previousTargetPrevious = targetPdf(previousPosition, previousNormal,
+                                                      previousReservoir.light, previousReservoir.u);
+            currentWeight *= balanceHeuristic(cur.M * currentTarget,
+                                              previousReservoir.M * currentTargetPrevious);
+            previousWeight *= balanceHeuristic(previousReservoir.M * previousTargetPrevious,
+                                               cur.M * previousTargetCurrent);
+        }
+
+        if (haveCurrent) {
+            resUpdate(wsumSolar, selectedLightSolar, selectedUSolar, selectedTargetSolar,
+                      cur.light, cur.u, currentTarget, currentWeight, s);
+            confidenceSolar += cur.M;
+        }
+        if (havePrevious) {
+            resUpdate(wsumSolar, selectedLightSolar, selectedUSolar, selectedTargetSolar,
+                      previousReservoir.light, previousReservoir.u, previousTargetCurrent,
+                      previousWeight, s);
+            confidenceSolar += previousReservoir.M;
+        }
+
+        Res solarReservoir;
+        solarReservoir.light = selectedLightSolar;
+        solarReservoir.u = selectedUSolar;
+        solarReservoir.M = confidenceSolar;
+        solarReservoir.W = selectedTargetSolar > 0.0 ? wsumSolar / selectedTargetSolar : 0.0;
+        if (badf(solarReservoir.W) || badf(solarReservoir.M) || badf(wsumSolar)) {
+            solarReservoir = emptyRes();
+        }
+        imageStore(resTCur, ip, packRes(solarReservoir));
+        return;
+    }
+
     float wsum = 0.0, selP = 0.0, M = 0.0;
     uint  selTri = NO_LIGHT;
     vec2  selB = vec2(0.0);

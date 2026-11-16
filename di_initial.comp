@@ -38,7 +38,7 @@ void main() {
     }
 
     Res r;
-    r.light = selTri; r.u = selB; r.M = float(M);
+    r.light = selTri; r.u = selB; r.M = U.misc2.w != 0u ? 1.0 : float(M);
     r.W = selP > 0.0 ? wsum / (float(M) * selP) : 0.0;
 
     if (badf(r.W) || badf(r.M) || badf(wsum)) r = emptyRes();

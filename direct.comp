@@ -36,7 +36,8 @@ void main() {
 
     vec4 outv = vec4(Ld, 1.0);
     ivec2 pp;
-    if ((U.misc0.w & 1u) != 0u && U.misc0.z > 0u && reproject(p, pp) && historyValid(pp, p, n)) {
+    if (U.misc2.w == 0u && (U.misc0.w & 1u) != 0u && U.misc0.z > 0u &&
+        reproject(p, pp) && historyValid(pp, p, n)) {
         vec4  hist  = imageLoad(dirPrev, pp);
         if (any(isnan(hist)) || any(isinf(hist))) hist = vec4(0.0);   
         float count = min(hist.a + 1.0, U.params2.z);

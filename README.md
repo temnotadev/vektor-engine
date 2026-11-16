@@ -1,5 +1,3 @@
-
-
 ![Logo](<repo/Frame 6.png>)
 # Vektor Engine (early beta)
 
@@ -10,7 +8,7 @@ Open Source game engine inspired by UE rendering techniques like ReSTIR DI from 
 
 ## Features
 
-- Realtime Ray Tracing with 1000+ lights via ReSTIR DI, RTGI
+- Realtime Ray Tracing with 1000+ lights via Solar DI (Optimized ReSTIR), RTGI
 - Easy scripting language .SCR
 - Optimized Editor
 - Vulkan Crossplatform
@@ -18,10 +16,16 @@ Open Source game engine inspired by UE rendering techniques like ReSTIR DI from 
 
 ## Demo
 
-In shown example we loaded de_dust2 voxel scene, due to ReSTIR DI and optimized RTGI we can place magnitudes of lights. For example in our scene we placed 1000 lights (3 additional lights is directional, sky, and area emission shape in sky) we getting extremely good results in our case, remember all lights are fully dynamic with ray traced shadows and dynamic bounces.
+In shown example we loaded de_dust2 voxel scene, due to Solar DI and optimized RTGI we can place magnitudes of lights. For example in our scene we placed 1000 lights (3 additional lights is directional, sky, and area emission shape in sky) we getting extremely good results in our case, remember all lights are fully dynamic with ray traced shadows and dynamic bounces.
 
-![Logo](<repo/Знімок екрана 2026-11-16 181037.png>)
+![Demo](<repo/Знімок екрана 2026-11-16 181037.png>)
 
+
+## Technical Breakdown
+
+Engine used special technologies to get realestic lighting, and good perfomance. In this image you can find a simple breakdown:
+
+![Logo](<repo/Frame 7.png>)
 
 ## Building
 

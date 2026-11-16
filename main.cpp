@@ -848,7 +848,7 @@ int activeDlssMode = 0;
                    U32 = VK_FORMAT_R32G32B32A32_UINT, R8 = VK_FORMAT_R8G8B8A8_UNORM;
     Image gND[2] = {createImage(renderW, renderH, F32), createImage(renderW, renderH, F32)};
     Image gAlbedo = createImage(renderW, renderH, F16);
-    Image resInit = createImage(renderW, renderH, U32);
+    Image resInit = createImage(renderW, renderH, U32, VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     Image resT[2] = {createImage(renderW, renderH, U32), createImage(renderW, renderH, U32)};
     Image resSpatial = createImage(renderW, renderH, U32);
     Image gi[2] = {createImage(renderW, renderH, F16), createImage(renderW, renderH, F16)};
@@ -1044,7 +1044,7 @@ int activeDlssMode = 0;
         std::fprintf(stderr, "NRD GI initialization failed (%u)\n", static_cast<uint32_t>(nrdResult));
         return 1;
     }
-    nrd::RelaxSettings nrdDISettings{};
+    nrd::RelaxSettings nrdDISettings{};  
     nrdDISettings.diffuseMaxAccumulatedFrameNum = 20;
     nrdDISettings.diffuseMaxFastAccumulatedFrameNum = 6;
     nrd::ReblurSettings nrdGISettings{};
@@ -1098,7 +1098,8 @@ int activeDlssMode = 0;
     cam.pitch = std::clamp(world.camPitch * kPi / 180.0f, -1.55f, 1.55f);
     lastCam = cam;
     bool temporal = true, spatial = true;
-    uint32_t lightMode = 2;  
+    constexpr uint32_t SOLARI_DI_MODE = 3u;
+    uint32_t lightMode = 3;  
     float exposure = 1.0f;
     uint32_t dbg = 0, giBounces = 1, candIdx = 2;  
     const uint32_t candTable[6] = {1, 4, 8, 12, 16, 32};
@@ -1264,7 +1265,10 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
         if (edge[GLFW_KEY_Y]) spatial = !spatial;
         if (edge[GLFW_KEY_G]) giBounces = (giBounces + 1) % 4;
         if (edge[GLFW_KEY_C]) candIdx = (candIdx + 1) % 6;
-        if (edge[GLFW_KEY_M]) lightMode = (lightMode + 1) % 3;  
+        if (edge[GLFW_KEY_M]) {
+            lightMode = (lightMode + 1) % (SOLARI_DI_MODE + 1);
+            frame = 0;
+        }
         if (edge[GLFW_KEY_N]) world.giMode = (world.giMode + 1) % 3;                  
         if (edge[GLFW_KEY_H]) {
             if (world.giMode == 2) world.giOffscreenRate = world.giOffscreenRate == 1 ? 8 : 1;
@@ -1337,7 +1341,8 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
         u.misc0[0] = renderW; u.misc0[1] = renderH; u.misc0[2] = frame; u.misc0[3] = (temporal ? 1u : 0u) | (spatial ? 2u : 0u);
         u.misc1[0] = numLights; u.misc1[1] = dbg; u.misc1[2] = giBounces; u.misc1[3] = candTable[candIdx];
         u.params[0] = exposure; u.params[1] = 32.0f; u.params[2] = 12.0f; u.params[3] = 10.0f;   
-        u.misc2[0] = tilesX; u.misc2[1] = lightMode; u.misc2[2] = nDir;
+        u.misc2[0] = tilesX; u.misc2[1] = lightMode == SOLARI_DI_MODE ? 2u : lightMode; u.misc2[2] = nDir;
+        u.misc2[3] = lightMode == SOLARI_DI_MODE ? 1u : 0u;
         u.params2[0] = float(1.0 / totalPower); u.params2[1] = tileCutoff; u.params2[2] = 16.0f;
         u.params2[3] = 2.0f * tanHalf / float(renderH);    
         for (int a = 0; a < 3; ++a) { u.gridMin[a] = gridMinV[a]; u.gridInvCell[a] = gridInvV[a]; u.gridDim[a] = GRID; }
@@ -1459,6 +1464,57 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
             else if (i == 6) { if (world.giMode > 0 && cacheBudget > 0) vkCmdDispatch(cmd, (cacheBudget + 63) / 64, 1, 1); }   
             else vkCmdDispatch(cmd, gx, gy, 1);
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            if (i == 5 && lightMode == SOLARI_DI_MODE) {
+                VkImage images[] = {resInit.img, resT[frame & 1].img};
+                VkAccessFlags copySrcAccess[] = {
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                };
+                VkAccessFlags copyDstAccess[] = {
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT
+                };
+                VkImageMemoryBarrier toCopy[2]{};
+                for (uint32_t j = 0; j < 2; ++j) {
+                    toCopy[j].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    toCopy[j].srcAccessMask = copySrcAccess[j];
+                    toCopy[j].dstAccessMask = copyDstAccess[j];
+                    toCopy[j].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    toCopy[j].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    toCopy[j].srcQueueFamilyIndex = toCopy[j].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toCopy[j].image = images[j];
+                    toCopy[j].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                }
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                     2, toCopy);
+
+                VkImageCopy historyCopy{};
+                historyCopy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                historyCopy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                historyCopy.extent = {renderW, renderH, 1};
+                vkCmdCopyImage(cmd, resInit.img, VK_IMAGE_LAYOUT_GENERAL,
+                               resT[frame & 1].img, VK_IMAGE_LAYOUT_GENERAL, 1, &historyCopy);
+
+                VkAccessFlags afterCopySrcAccess[] = {
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT
+                };
+                VkImageMemoryBarrier afterCopy[2]{};
+                for (uint32_t j = 0; j < 2; ++j) {
+                    afterCopy[j].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    afterCopy[j].srcAccessMask = afterCopySrcAccess[j];
+                    afterCopy[j].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                    afterCopy[j].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    afterCopy[j].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    afterCopy[j].srcQueueFamilyIndex = afterCopy[j].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    afterCopy[j].image = images[j];
+                    afterCopy[j].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                }
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                                     2, afterCopy);
+            }
         if (i == 0) runCustom(0);          
         if (i == 8) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 9);
         else if (i == 9) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 11);
@@ -1619,9 +1675,9 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
             for (double a : passAcc) total += a;
             char title[300];
             std::snprintf(title, sizeof(title),
-                          "rt_renderer | GPU %.2f ms | %zu objects, %u lights (area:%s), sampling:%s | GI:%s rate:%d | temporal:%s spatial:%s | DI cand:%u | bounces:%u | view:%u",
+                          "rt_renderer | GPU %.2f ms | %zu objects, %u lights (area:%s), DI:%s | GI:%s rate:%d | temporal:%s spatial:%s | DI cand:%u | bounces:%u | view:%u",
                           total / accFrames, world.objects.size(), numLights, world.areaLights ? "on" : "off",
-            (lightMode == 0 ? "global" : lightMode == 1 ? "tile/grid" : "BVH"),
+            (lightMode == 0 ? "global" : lightMode == 1 ? "tile/grid" : lightMode == 2 ? "BVH" : "solaridi"),
                           world.giMode == 0 ? "path" : world.giMode == 1 ? "surface cache" : "screen+BVH",
                           world.giMode == 2 ? (int)world.giOffscreenRate : world.giRate,
                           temporal ? "on" : "off", spatial ? "on" : "off", candTable[candIdx], giBounces, dbg);
