@@ -1,0 +1,38 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+vec3 aces(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, U.misc0.xy))) return;
+    ivec2 ip = ivec2(px);
+
+    vec4 nd  = imageLoad(gND, ip);
+    vec4 alb = imageLoad(gAlbedo, ip);
+    vec3 color = vec3(0.0), lit = vec3(0.0);
+
+    if (nd.w > 0.0 && alb.a > 0.5) {
+        color = alb.rgb;                                       
+    } else if (nd.w > 0.0) {
+        vec3 direct = imageLoad(dirCur, ip).rgb;
+        vec3 gi = imageLoad(giCur, ip).rgb;
+        lit = alb.rgb * (direct + gi);
+        uint mode = U.misc1.y;                                 
+        if (mode != 2u) color += alb.rgb * direct;
+        if (mode != 1u) color += alb.rgb * gi;
+    } else {
+        color = skyRadiance(primaryDir(px));
+    }
+    imageStore(litCur, ip, vec4(lit, 1.0));                    
+
+    color = aces(color * U.params.x);
+    color = pow(color, vec3(1.0 / 2.2));
+    imageStore(finalImg, ip, vec4(color, 1.0));
+}

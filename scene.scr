@@ -1,0 +1,57 @@
+#main scene thing
+
+builtin pointlights 1
+
+gi screen
+gi offscreen 4
+area on
+
+denoise 4
+
+dlss off
+
+texture wall E:\cppprojects\rtengine\assets\wall.png
+
+model Untitled E:\cppprojects\rtengine\assets\Untitled.obj
+
+collider cube2 pos -0.126 -0.150 -0.751 size 2.350 1.000 1.000 rot 0.000 -4.000 0.000
+spawn Untitled1 Untitled pos 1.468 0.500 1.298 size 6.000 6.000 6.000 color 0.800 0.800 0.800 tex wall
+collider cube1 pos 1.734 -1.350 -0.566 size 6.650 1.250 2.250
+collider cube3 pos 3.152 -1.400 2.205 size 2.750 1.050 4.400
+collider cube4 pos 1.263 -1.450 1.644 size 0.800 1.050 5.550
+
+light point lamp1 -2.000 3.000 2.000 1.000 0.950 0.850 12.000
+
+
+on key V
+  rand $x -2 2
+  rand $y 0.5 4.5
+  rand $z -2 2
+  rand $r 0.2 1
+  rand $g 0.2 1
+  rand $b 0.2 1
+  light point lamp# $x $y $z $r $g $b 0.1 6 0.05
+end
+
+var $lampX -2.0
+var $lampDirection 1
+
+on key J
+  calc $lampX $lampX + 2
+end
+
+on frame
+  calc $lampStep $dt * 0.6
+  calc $lampStep $lampStep * $lampDirection
+  calc $lampX $lampX + $lampStep
+  if $lampX >= -1.5
+    var $lampDirection -1
+  endif
+  if $lampX <= -2.5
+    var $lampDirection 1
+  endif
+  set lamp1 pos $lampX 3 2
+end
+
+builtin sun
+
