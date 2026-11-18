@@ -1,0 +1,102 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 33, rgba16f) uniform image2D nrdDIOutput;
+layout(set = 0, binding = 36, rgba16f) uniform image2D nrdSpecOutput;
+layout(set = 0, binding = 37, rgba16f) uniform image2D nrdDIHalfInput;
+layout(set = 0, binding = 38, rgba16f) uniform image2D nrdDIHalfSpecInput;
+layout(set = 0, binding = 39, rg16f) uniform image2D nrdDIHalfMotion;
+layout(set = 0, binding = 40, rgb10_a2) uniform image2D nrdDIHalfNormalRoughness;
+layout(set = 0, binding = 41, r32f) uniform image2D nrdDIHalfViewZ;
+layout(set = 0, binding = 42, rgba16f) uniform image2D nrdDIHalfOutput;
+layout(set = 0, binding = 43, rgba16f) uniform image2D nrdDIHalfSpecOutput;
+
+vec3 decodeNormal(vec4 encoded) {
+    vec2 oct = vec2(encoded.x - encoded.y, encoded.x + encoded.y - 1.0);
+    float z = 1.0 - abs(oct.x) - abs(oct.y);
+    z = encoded.z < 0.5 ? -z : z;
+    return normalize(vec3(oct, z));
+}
+
+float guideWeight(ivec2 halfPixel, vec3 normal, float viewZ, vec2 halfPosition) {
+    vec4 guide = imageLoad(nrdDIHalfNormalRoughness, halfPixel);
+    float guideViewZ = imageLoad(nrdDIHalfViewZ, halfPixel).x;
+    if (guideViewZ >= 60000.0) return 0.0;
+
+    vec2 delta = abs(vec2(halfPixel) - halfPosition);
+    float spatialWeight = max(1.0 - delta.x, 0.0) * max(1.0 - delta.y, 0.0);
+    float normalWeight = pow(max(dot(normal, decodeNormal(guide)), 0.0), 32.0);
+    float depthSigma = max(viewZ * 0.02, 0.02);
+    float depthWeight = exp(-abs(viewZ - guideViewZ) / depthSigma);
+    return spatialWeight * normalWeight * depthWeight;
+}
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(px, U.misc0.xy))) return;
+
+    ivec2 fullPixel = ivec2(px);
+    ivec2 halfSize  = ivec2((U.misc0.xy + 1u) / 2u);
+
+    vec4 nd = imageLoad(gND, fullPixel);
+    bool isSky = nd.w <= 0.0;
+    vec3 normal = isSky ? vec3(0.0, 0.0, 1.0) : normalize(nd.xyz);
+    float viewZ = isSky ? 60000.0
+                        : max(dot(primaryDir(px), U.camFwd.xyz) * nd.w, 1e-3);
+
+    vec2 halfPosition = (vec2(px) + 0.5) * 0.5 - 0.5;
+    ivec2 base = ivec2(floor(halfPosition));
+    vec2 f = halfPosition - vec2(base);
+
+    vec4 diffuse = vec4(0.0), specular = vec4(0.0);
+    float totalWeight = 0.0;
+
+    float bestGuide = -1.0;
+    ivec2 bestPixel = clamp(base, ivec2(0), halfSize - 1);
+
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            ivec2 sp = clamp(base + ivec2(x, y), ivec2(0), halfSize - 1);
+
+            float bilinear = (x == 0 ? 1.0 - f.x : f.x) *
+                             (y == 0 ? 1.0 - f.y : f.y);
+
+            float sampleViewZ = imageLoad(nrdDIHalfViewZ, sp).x;
+            bool sampleSky = sampleViewZ >= 60000.0;
+
+            float guide;
+            if (isSky) {
+                guide = sampleSky ? 1.0 : 0.0;
+            } else if (sampleSky) {
+                guide = 0.0;
+            } else {
+                vec3 gN = decodeNormal(imageLoad(nrdDIHalfNormalRoughness, sp));
+                float nW = pow(max(dot(normal, gN), 0.0), 32.0);
+                float sigma = max(viewZ * 0.02, 0.02);
+                float dW = exp(-abs(viewZ - sampleViewZ) / sigma);
+                guide = nW * dW;
+            }
+
+            if (guide > bestGuide) { bestGuide = guide; bestPixel = sp; }
+
+            float w = bilinear * guide;
+            diffuse  += imageLoad(nrdDIHalfOutput, sp) * w;
+            specular += imageLoad(nrdDIHalfSpecOutput, sp) * w;
+            totalWeight += w;
+        }
+    }
+
+    if (totalWeight > 1e-4) {
+        diffuse /= totalWeight;
+        specular /= totalWeight;
+    } else {
+        // best geometric match, not nearest by distance
+        diffuse  = imageLoad(nrdDIHalfOutput, bestPixel);
+        specular = imageLoad(nrdDIHalfSpecOutput, bestPixel);
+    }
+
+    imageStore(nrdDIOutput, fullPixel, diffuse);
+    imageStore(nrdSpecOutput, fullPixel, specular);
+}

@@ -10,16 +10,109 @@ layout(set = 0, binding = 29, rgba16f) uniform image2D nrdGIInput;
 layout(set = 0, binding = 30, rg16f) uniform image2D nrdMotion;
 layout(set = 0, binding = 31, rgb10_a2) uniform image2D nrdNormalRoughness;
 layout(set = 0, binding = 32, r32f) uniform image2D nrdViewZ;
+layout(set = 0, binding = 37, rgba16f) uniform image2D nrdDIHalfInput;
+layout(set = 0, binding = 38, rgba16f) uniform image2D nrdDIHalfSpecInput;
+layout(set = 0, binding = 39, rg16f) uniform image2D nrdDIHalfMotion;
+layout(set = 0, binding = 40, rgb10_a2) uniform image2D nrdDIHalfNormalRoughness;
+layout(set = 0, binding = 41, r32f) uniform image2D nrdDIHalfViewZ;
 
 vec4 packDiffuse(vec4 signal, float viewZ) {
     float normHitDist = clamp(signal.a / (3.0 + viewZ * 0.1), 0.0, 1.0);
     return vec4(signal.rgb, normHitDist);
 }
 
+vec4 encodeNormalRoughness(vec3 n, float roughness) {
+    vec3 octNormal = n / (abs(n.x) + abs(n.y) + abs(n.z));
+    float encY = octNormal.y * 0.5 + 0.5;
+    float encX = octNormal.x * 0.5 + encY;
+    encY -= octNormal.x * 0.5;
+    float signedRoughness = n.z < 0.0 ? -roughness : roughness;
+    return vec4(encX, encY, signedRoughness * 0.5 + 0.5, 0.0);
+}
+
+float getViewZ(ivec2 p, vec4 nd) {
+    return max(dot(primaryDir(uvec2(p)), U.camFwd.xyz) * nd.w, 1e-3);
+}
+
+vec2 getMotion(ivec2 p, vec4 nd) {
+    vec2 motion = vec2(0.0);
+    vec3 previousViewPosition = worldPos(uvec2(p), nd.w) - U.prevPos.xyz;
+    float previousViewZ = dot(previousViewPosition, U.prevFwd.xyz);
+    if (previousViewZ > 1e-4) {
+        vec2 previousNdc = vec2(
+            dot(previousViewPosition, U.prevRight.xyz) /
+                (previousViewZ * dot(U.prevRight.xyz, U.prevRight.xyz)),
+            dot(previousViewPosition, U.prevUp.xyz) /
+                (previousViewZ * dot(U.prevUp.xyz, U.prevUp.xyz)));
+        vec2 previousUv = vec2(previousNdc.x * 0.5 + 0.5, 0.5 - previousNdc.y * 0.5);
+        vec2 currentUv = (vec2(p) + 0.5 + U.jitter.xy) / vec2(U.misc0.xy);
+        motion = previousUv - currentUv;
+    }
+    return motion;
+}
+
+void prepareDIHalf(uvec2 px) {
+    if (any(notEqual(px & uvec2(1), uvec2(0)))) return;
+
+    ivec2 base = ivec2(px);
+    ivec2 bestPixel = ivec2(-1);
+    float bestViewZ = 60000.0;
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            ivec2 p = base + ivec2(x, y);
+            if (any(greaterThanEqual(p, ivec2(U.misc0.xy)))) continue;
+            vec4 nd = imageLoad(gND, p);
+            if (nd.w <= 0.0) continue;
+            float viewZ = getViewZ(p, nd);
+            if (viewZ < bestViewZ) {
+                bestViewZ = viewZ;
+                bestPixel = p;
+            }
+        }
+    }
+
+    ivec2 halfPixel = base / 2;
+    if (bestPixel.x < 0) {
+        imageStore(nrdDIHalfViewZ, halfPixel, vec4(60000.0));
+        imageStore(nrdDIHalfNormalRoughness, halfPixel, vec4(0.5, 0.5, 1.0, 0.0));
+        imageStore(nrdDIHalfMotion, halfPixel, vec4(0.0));
+        imageStore(nrdDIHalfInput, halfPixel, vec4(0.0));
+        imageStore(nrdDIHalfSpecInput, halfPixel, vec4(0.0));
+        return;
+    }
+
+    vec4 bestND = imageLoad(gND, bestPixel);
+    vec3 bestNormal = normalize(bestND.xyz);
+    float roughness = max(1.0 - clamp(imageLoad(gMaterial, bestPixel).y, 0.0, 1.0), 1.5 / 512.0);
+    imageStore(nrdDIHalfViewZ, halfPixel, vec4(bestViewZ));
+    imageStore(nrdDIHalfNormalRoughness, halfPixel, encodeNormalRoughness(bestNormal, roughness));
+    imageStore(nrdDIHalfMotion, halfPixel, vec4(getMotion(bestPixel, bestND), 0.0, 0.0));
+
+    vec4 diffuse = vec4(0.0);
+    vec4 specular = vec4(0.0);
+    float sampleCount = 0.0;
+    float depthThreshold = max(bestViewZ * 0.02, 0.02);
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            ivec2 p = base + ivec2(x, y);
+            if (any(greaterThanEqual(p, ivec2(U.misc0.xy)))) continue;
+            vec4 nd = imageLoad(gND, p);
+            if (nd.w <= 0.0 || dot(bestNormal, normalize(nd.xyz)) < 0.9) continue;
+            if (abs(getViewZ(p, nd) - bestViewZ) > depthThreshold) continue;
+            diffuse += imageLoad(nrdRawDI, p);
+            specular += imageLoad(directSpec, p);
+            sampleCount += 1.0;
+        }
+    }
+    imageStore(nrdDIHalfInput, halfPixel, diffuse / sampleCount);
+    imageStore(nrdDIHalfSpecInput, halfPixel, specular / sampleCount);
+}
+
 void main() {
     uvec2 px = gl_GlobalInvocationID.xy;
     if (any(greaterThanEqual(px, U.misc0.xy))) return;
     ivec2 ip = ivec2(px);
+    if (U.params3.z > 0.0) prepareDIHalf(px);
 
     vec4 nd = imageLoad(gND, ip);
     if (nd.w <= 0.0) {
@@ -35,28 +128,9 @@ void main() {
     float viewZ = max(dot(rayDir, U.camFwd.xyz) * nd.w, 1e-3);
     vec3 n = normalize(nd.xyz);
     imageStore(nrdViewZ, ip, vec4(viewZ));
-    vec3 octNormal = n / (abs(n.x) + abs(n.y) + abs(n.z));
-    float encY = octNormal.y * 0.5 + 0.5;
-    float encX = octNormal.x * 0.5 + encY;
-    encY -= octNormal.x * 0.5;
-    float signedRoughness = n.z < 0.0 ? -1.0 : 1.0;
-    float encZ = signedRoughness * 0.5 + 0.5;
-    imageStore(nrdNormalRoughness, ip, vec4(encX, encY, encZ, 0.0));
-
-    vec2 motion = vec2(0.0);
-    vec3 previousViewPosition = worldPos(px, nd.w) - U.prevPos.xyz;
-    float previousViewZ = dot(previousViewPosition, U.prevFwd.xyz);
-    if (previousViewZ > 1e-4) {
-        vec2 previousNdc = vec2(
-            dot(previousViewPosition, U.prevRight.xyz) /
-                (previousViewZ * dot(U.prevRight.xyz, U.prevRight.xyz)),
-            dot(previousViewPosition, U.prevUp.xyz) /
-                (previousViewZ * dot(U.prevUp.xyz, U.prevUp.xyz)));
-        vec2 previousUv = vec2(previousNdc.x * 0.5 + 0.5, 0.5 - previousNdc.y * 0.5);
-        vec2 currentUv = (vec2(px) + 0.5 + U.jitter.xy) / vec2(U.misc0.xy);
-        motion = previousUv - currentUv;
-    }
-    imageStore(nrdMotion, ip, vec4(motion, 0.0, 0.0));
+    float roughness = max(1.0 - clamp(imageLoad(gMaterial, ip).y, 0.0, 1.0), 1.5 / 512.0);
+    imageStore(nrdNormalRoughness, ip, encodeNormalRoughness(n, roughness));
+    imageStore(nrdMotion, ip, vec4(getMotion(ip, nd), 0.0, 0.0));
 
     imageStore(nrdDIInput, ip, imageLoad(nrdRawDI, ip));
     imageStore(nrdGIInput, ip, packDiffuse(imageLoad(nrdRawGI, ip), viewZ));

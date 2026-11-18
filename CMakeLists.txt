@@ -42,6 +42,19 @@ FetchContent_Declare(nrd
   URL https://github.com/NVIDIA-RTX/NRD/archive/refs/tags/v4.18.0.zip)
 FetchContent_MakeAvailable(nrd)
 
+set(TARGET_HELLO_WORLD OFF CACHE BOOL "" FORCE)
+set(TARGET_SAMPLES OFF CACHE BOOL "" FORCE)
+set(TARGET_VIEWER OFF CACHE BOOL "" FORCE)
+set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
+set(TARGET_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+set(ENABLE_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(JoltPhysics
+  GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
+  GIT_TAG v5.3.0
+  SOURCE_SUBDIR Build)
+FetchContent_MakeAvailable(JoltPhysics)
+
 # Accept either the folder layout (src/, shaders/) or all files flat next to this file.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp)
   set(MAIN_CPP ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp)
@@ -50,8 +63,8 @@ elseif(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 else()
   message(FATAL_ERROR "main.cpp not found next to CMakeLists.txt or in src/")
 endif()
-add_executable(rt_renderer ${MAIN_CPP})
-target_link_libraries(rt_renderer PRIVATE Vulkan::Vulkan glfw NRD NRI NRDIntegration)
+add_executable(rt_renderer ${MAIN_CPP} ${CMAKE_CURRENT_SOURCE_DIR}/physics.cpp)
+target_link_libraries(rt_renderer PRIVATE Vulkan::Vulkan glfw NRD NRI NRDIntegration Jolt)
 # world.hpp / stb_image.h live in src/ (or next to this file in a flat layout)
 target_include_directories(rt_renderer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -116,7 +129,7 @@ endif()
 set(SHADER_OUT ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUT})
 set(SPV_FILES)
-foreach(S gbuffer light_grid cache_update tile_lights di_initial di_temporal di_spatial direct gi nrd_prep composite)
+foreach(S gbuffer light_grid cache_update tile_lights di_initial di_temporal di_spatial direct gi nrd_prep nrd_di_upsample composite)
   set(IN  ${SHADER_DIR}/${S}.comp)
   set(OUT ${SHADER_OUT}/${S}.comp.spv)
   if(GLSLANG_VALIDATOR)

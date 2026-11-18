@@ -24,6 +24,7 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#include "physics.hpp"
 
 
 constexpr float kPi = 3.14159265359f;
@@ -57,8 +58,9 @@ struct GpuTri {
     float uv01[4];                                  
     float uv2m[4];                                  
     uint32_t cache[4];                              
+    float material[4];
 };
-static_assert(sizeof(GpuTri) == 128, "GpuTri must match the std430 Tri struct in common.glsl");
+static_assert(sizeof(GpuTri) == 144, "GpuTri must match the std430 Tri struct in common.glsl");
 
 enum LightType : uint32_t { LIGHT_TRI = 0, LIGHT_POINT = 1, LIGHT_SPOT = 2, LIGHT_DIR = 3 };
 struct GpuLight {                                   
@@ -93,9 +95,21 @@ struct Object {
     std::string name; int mesh = 0;
     V3 pos{0, 0, 0}, rot{0, 0, 0}, size{1, 1, 1}, color{0.73f, 0.73f, 0.73f}, emit{0, 0, 0};
     int tex = -1; float uvscale = 1.0f;
+    std::string material;
     bool texClamp = false, texNearest = false;
     bool collide = true;                              
     bool collisionOnly = false;
+    bool physicsEnabled = false;
+    bool physicsDynamic = false;
+    float mass = 1.0f;
+    float friction = 0.2f;
+    float restitution = 0.0f;
+};
+struct Material {
+    V3 color{1, 1, 1};
+    int tex = -1, normal = -1;
+    float metallic = 0.0f, smoothness = 0.5f, reflectivity = 0.0f;
+    bool ssr = false;
 };
 struct LightDef {
     std::string name; uint32_t type = LIGHT_POINT;
@@ -380,6 +394,7 @@ struct World {
     std::vector<Object> objects;
     std::vector<LightDef> lights;
     std::vector<CustomShader> shaders;
+    std::map<std::string, Material> materials;
     std::map<std::string, int> texIds, texByPath;     
     int texCount = 0;
     std::vector<TexUpload> pendingTex;                
@@ -413,12 +428,14 @@ struct World {
     float time = 0, dt = 0; uint32_t frame = 0;
     V3 camPos{0, 2.5f, 8.5f}; float camYaw = 0, camPitch = 0;   
     bool camChanged = false;
+    PhysicsWorld physics;
 
     World() {
         for (Mesh m : {makeCube(), makeQuad(), makeSphere()}) { meshIndex[m.name] = (int)meshes.size(); meshes.push_back(m); }
     }
     void clearScene() {                               
-        objects.clear(); lights.clear(); shaders.clear(); vars.clear(); texIds.clear(); spawnCounter = 0; dirty = true;
+        objects.clear(); lights.clear(); shaders.clear(); materials.clear(); vars.clear(); texIds.clear(); spawnCounter = 0; dirty = true;
+        physics.clear();
         areaLights = true; giMode = 1; giRate = 1; giOffscreenRate = 8; cacheCellSize = 0.3f;
         denoise = 1.0f; dlssMode = 0; camCollide = false; camLocked = false; camRadius = 0.3f;
         playerController = false; playerGravity = true; playerGrounded = false; playerVelocityY = 0.0f;
@@ -512,6 +529,43 @@ struct World {
         }
         return p;
     }
+    void updatePhysics(float dt) {
+        std::vector<PhysicsBodyDesc> bodies;
+        bodies.reserve(objects.size());
+        for (const Object& object : objects) {
+            if (!object.physicsEnabled) continue;
+            PhysicsBodyDesc body;
+            body.name = object.name;
+            body.position[0] = object.pos.x; body.position[1] = object.pos.y; body.position[2] = object.pos.z;
+            body.rotation[0] = object.rot.x; body.rotation[1] = object.rot.y; body.rotation[2] = object.rot.z;
+            body.size[0] = object.size.x; body.size[1] = object.size.y; body.size[2] = object.size.z;
+            body.mass = object.mass;
+            body.friction = object.friction;
+            body.restitution = object.restitution;
+            body.dynamic = object.physicsDynamic;
+            bodies.push_back(std::move(body));
+        }
+        std::vector<PhysicsTransform> transforms;
+        physics.update(bodies, dt, transforms);
+        for (const PhysicsTransform& transform : transforms) {
+            for (Object& object : objects) {
+                if (object.name != transform.name) continue;
+                const bool changed =
+                    std::fabs(object.pos.x - transform.position[0]) > 1.0e-4f ||
+                    std::fabs(object.pos.y - transform.position[1]) > 1.0e-4f ||
+                    std::fabs(object.pos.z - transform.position[2]) > 1.0e-4f ||
+                    std::fabs(object.rot.x - transform.rotation[0]) > 1.0e-3f ||
+                    std::fabs(object.rot.y - transform.rotation[1]) > 1.0e-3f ||
+                    std::fabs(object.rot.z - transform.rotation[2]) > 1.0e-3f;
+                if (changed) {
+                    object.pos = {transform.position[0], transform.position[1], transform.position[2]};
+                    object.rot = {transform.rotation[0], transform.rotation[1], transform.rotation[2]};
+                    dirty = true;
+                }
+                break;
+            }
+        }
+    }
     void enablePlayerController() {
         playerController = true;
         playerGrounded = false;
@@ -593,13 +647,16 @@ struct Scene {
     V3 bmin{1e30f, 1e30f, 1e30f}, bmax{-1e30f, -1e30f, -1e30f};
 
     void addTri(V3 a, V3 b, V3 c, V3 albedo, V3 emission, const float uv[3][2], int layer, float footprint,
-                uint32_t wrapMode = 0u, uint32_t filterMode = 0u) {
+                uint32_t wrapMode = 0u, uint32_t filterMode = 0u, int normalLayer = -1,
+                float metallic = 0.0f, float smoothness = 0.5f, float reflectivity = 0.0f, bool ssr = false) {
         if (tris.size() >= MAX_TRIS) { truncated = true; return; }
         GpuTri t{};
         auto set4 = [](float* d, V3 v) { d[0] = v.x; d[1] = v.y; d[2] = v.z; d[3] = 0; };
         set4(t.p0, a); set4(t.p1, b); set4(t.p2, c); set4(t.albedo, albedo); set4(t.emission, emission);
         t.uv01[0] = uv[0][0]; t.uv01[1] = uv[0][1]; t.uv01[2] = uv[1][0]; t.uv01[3] = uv[1][1];
         t.uv2m[0] = uv[2][0]; t.uv2m[1] = uv[2][1]; t.uv2m[2] = float(layer); t.uv2m[3] = footprint;
+        t.material[0] = float(normalLayer); t.material[1] = metallic; t.material[2] = smoothness;
+        t.material[3] = ssr ? -std::max(reflectivity, 0.001f) : reflectivity;
         
         {
             V3 e0 = b - a, e1 = c - b, e2 = a - c;
@@ -619,6 +676,16 @@ struct Scene {
             layoutHash = (layoutHash ^ k) * 1099511628211ull;
             layoutHash = (layoutHash ^ wrapMode) * 1099511628211ull;
             layoutHash = (layoutHash ^ filterMode) * 1099511628211ull;
+            auto hashFloat = [&](float value) {
+                uint32_t bits;
+                std::memcpy(&bits, &value, sizeof(bits));
+                layoutHash = (layoutHash ^ bits) * 1099511628211ull;
+            };
+            layoutHash = (layoutHash ^ static_cast<uint32_t>(layer)) * 1099511628211ull;
+            layoutHash = (layoutHash ^ static_cast<uint32_t>(normalLayer)) * 1099511628211ull;
+            hashFloat(albedo.x); hashFloat(albedo.y); hashFloat(albedo.z);
+            hashFloat(metallic); hashFloat(smoothness); hashFloat(reflectivity);
+            layoutHash = (layoutHash ^ static_cast<uint64_t>(ssr)) * 1099511628211ull;
             if (!dummy)
                 for (V3 v : {a, b, c}) {
                     bmin = {std::min(bmin.x, v.x), std::min(bmin.y, v.y), std::min(bmin.z, v.z)};
@@ -648,10 +715,28 @@ inline void buildScene(const World& w, Scene& s) {
     for (const Object& o : w.objects) {
         if (o.collisionOnly) continue;
         const Mesh& m = w.meshes[o.mesh];
+        const Material* material = nullptr;
+        if (!o.material.empty()) {
+            auto it = w.materials.find(o.material);
+            if (it != w.materials.end()) material = &it->second;
+        }
         bool emissive = o.emit.x > 0 || o.emit.y > 0 || o.emit.z > 0;
         bool emitOn = emissive && w.areaLights;        
-        V3 albedo = emissive ? V3{0, 0, 0} : o.color;   
-        int layer = emissive ? -1 : o.tex;
+        V3 albedo = emissive ? V3{0, 0, 0} : o.color;
+        int layer = o.tex;
+        int normalLayer = -1;
+        float metallic = 0.0f, smoothness = 0.5f, reflectivity = 0.0f;
+        bool ssr = false;
+        if (material) {
+            albedo = {albedo.x * material->color.x, albedo.y * material->color.y, albedo.z * material->color.z};
+            if (material->tex >= 0) layer = material->tex;
+            normalLayer = material->normal;
+            metallic = material->metallic;
+            smoothness = material->smoothness;
+            reflectivity = material->reflectivity;
+            ssr = material->ssr;
+        }
+        if (emissive) layer = -1;
         for (const MTri& mt : m.tris) {
             V3 q[3];
             float uv[3][2];
@@ -664,7 +749,8 @@ inline void buildScene(const World& w, Scene& s) {
             float uvArea = 0.5f * std::fabs((uv[1][0] - uv[0][0]) * (uv[2][1] - uv[0][1]) - (uv[2][0] - uv[0][0]) * (uv[1][1] - uv[0][1]));
             float footprint = worldArea > 1e-12f ? std::sqrt(uvArea / worldArea) : 0.0f;
             s.addTri(q[0], q[1], q[2], albedo, emitOn ? o.emit : V3{0, 0, 0}, uv, layer, footprint,
-                     o.texClamp ? 1u : 0u, o.texNearest ? 1u : 0u);
+                     o.texClamp ? 1u : 0u, o.texNearest ? 1u : 0u, normalLayer,
+                     metallic, smoothness, reflectivity, ssr);
         }
     }
     for (const LightDef& d : w.lights) {
@@ -904,6 +990,37 @@ private:
     Object* findObj(const std::string& n) { for (auto& o : w.objects) if (o.name == n) return &o; return nullptr; }
     LightDef* findLight(const std::string& n) { for (auto& l : w.lights) if (l.name == n) return &l; return nullptr; }
 
+    bool materialOption(Material& m, const std::vector<std::string>& t, size_t& i, int ln) {
+        const std::string& key = t[i];
+        if (key == "color" && i + 3 < t.size()) {
+            m.color = vec3(t, i + 1, ln);
+            i += 4;
+        } else if ((key == "texture" || key == "normal") && i + 1 < t.size()) {
+            int* layer = key == "texture" ? &m.tex : &m.normal;
+            if (t[i + 1] == "none") *layer = -1;
+            else {
+                auto it = w.texIds.find(t[i + 1]);
+                if (it == w.texIds.end()) { err(ln, "unknown texture '" + t[i + 1] + "'"); return false; }
+                *layer = it->second;
+            }
+            i += 2;
+        } else if ((key == "metallic" || key == "smoothness" || key == "reflectivity") && i + 1 < t.size()) {
+            float value = std::clamp(num(t[i + 1], ln), 0.0f, 1.0f);
+            if (key == "metallic") m.metallic = value;
+            else if (key == "smoothness") m.smoothness = value;
+            else m.reflectivity = value;
+            i += 2;
+        } else if (key == "ssr" && i + 1 < t.size()) {
+            if (t[i + 1] == "on" || t[i + 1] == "off") m.ssr = t[i + 1] == "on";
+            else { err(ln, "ssr must be on or off"); return false; }
+            i += 2;
+        } else {
+            err(ln, "bad material option '" + key + "'");
+            return false;
+        }
+        return true;
+    }
+
     void destroy(const std::string& pat) {
         bool prefix = !pat.empty() && pat.back() == '*';
         std::string base = prefix ? pat.substr(0, pat.size() - 1) : pat;
@@ -932,6 +1049,13 @@ private:
                 w.pendingTex.push_back(std::move(up));
             }
             w.texIds[t[1]] = layer;
+        } else if (c == "material") {
+            if (!need(t, 2, ln, "material <id> [color r g b] [texture id|none] [normal id|none] [metallic v] [smoothness v] [reflectivity v] [ssr on|off]")) return;
+            Material& material = w.materials[t[1]];
+            for (size_t i = 2; i < t.size();) {
+                if (!materialOption(material, t, i, ln)) return;
+            }
+            w.dirty = true;
         } else if (c == "model") {
             if (!need(t, 3, ln, "model <id> <file.obj> [raw]")) return;
             bool raw = t.size() > 3 && t[3] == "raw";
@@ -949,17 +1073,28 @@ private:
             }
             w.meshIndex[t[1]] = it->second;
         } else if (c == "collider") {
-            if (!need(t, 2, ln, "collider <name> [pos x y z] [rot x y z] [size x y z]")) return;
+            if (!need(t, 2, ln, "collider <name> [pos x y z] [rot x y z] [size x y z] [body off|static|dynamic]")) return;
             Object o;
             o.mesh = w.meshIndex.at("cube");
             o.name = t[1];
             o.collisionOnly = true;
+            o.physicsEnabled = true;
             bool valid = true;
             for (size_t i = 2; i < t.size();) {
                 const std::string& k = t[i];
                 if (k == "pos" && i + 3 < t.size()) { o.pos = vec3(t, i + 1, ln); i += 4; }
                 else if (k == "rot" && i + 3 < t.size()) { o.rot = vec3(t, i + 1, ln); i += 4; }
                 else if (k == "size" && i + 3 < t.size()) { o.size = vec3(t, i + 1, ln); i += 4; }
+                else if (k == "body" && i + 1 < t.size()) {
+                    if (t[i + 1] == "off") o.physicsEnabled = false;
+                    else if (t[i + 1] == "static") { o.physicsEnabled = true; o.physicsDynamic = false; }
+                    else if (t[i + 1] == "dynamic") { o.physicsEnabled = true; o.physicsDynamic = true; }
+                    else { err(ln, "body must be off, static or dynamic"); valid = false; break; }
+                    i += 2;
+                }
+                else if (k == "mass" && i + 1 < t.size()) { o.mass = num(t[i + 1], ln); i += 2; }
+                else if (k == "friction" && i + 1 < t.size()) { o.friction = num(t[i + 1], ln); i += 2; }
+                else if (k == "restitution" && i + 1 < t.size()) { o.restitution = num(t[i + 1], ln); i += 2; }
                 else { err(ln, "bad collider option '" + k + "'"); valid = false; break; }
             }
             if (!valid) return;
@@ -967,7 +1102,7 @@ private:
             w.objects.push_back(o);
             w.dirty = true;
         } else if (c == "spawn") {
-            if (!need(t, 3, ln, "spawn <name> <mesh> [pos x y z] [rot x y z] [size x y z|scale s] [color r g b] [tex id] [uvscale s] [wrap repeat|clamp] [filter linear|nearest] [emit r g b]")) return;
+            if (!need(t, 3, ln, "spawn <name> <mesh> [pos x y z] [rot x y z] [size x y z|scale s] [color r g b] [tex id] [material id] [uvscale s] [wrap repeat|clamp] [filter linear|nearest] [emit r g b] [body off|static|dynamic] [mass m] [friction f] [restitution r]")) return;
             auto mi = w.meshIndex.find(t[2]);
             if (mi == w.meshIndex.end()) { err(ln, "unknown mesh '" + t[2] + "' (cube, quad, sphere, or a model id)"); return; }
             Object o;
@@ -980,6 +1115,16 @@ private:
                 if (k == "pos" && i + 3 < t.size()) { o.pos = vec3(t, i + 1, ln); i += 4; }
                 else if (k == "rot" && i + 3 < t.size()) { o.rot = vec3(t, i + 1, ln); i += 4; }
                 else if (k == "size" && i + 3 < t.size()) { o.size = vec3(t, i + 1, ln); i += 4; }
+                else if (k == "body" && i + 1 < t.size()) {
+                    if (t[i + 1] == "off") o.physicsEnabled = false;
+                    else if (t[i + 1] == "static") { o.physicsEnabled = true; o.physicsDynamic = false; }
+                    else if (t[i + 1] == "dynamic") { o.physicsEnabled = true; o.physicsDynamic = true; }
+                    else { err(ln, "body must be off, static or dynamic"); return; }
+                    i += 2;
+                }
+                else if (k == "mass" && i + 1 < t.size()) { o.mass = num(t[i + 1], ln); i += 2; }
+                else if (k == "friction" && i + 1 < t.size()) { o.friction = num(t[i + 1], ln); i += 2; }
+                else if (k == "restitution" && i + 1 < t.size()) { o.restitution = num(t[i + 1], ln); i += 2; }
                 else if (k == "scale" && i + 1 < t.size()) { float s = num(t[i + 1], ln); o.size = {s, s, s}; i += 2; }
                 else if (k == "color" && i + 3 < t.size()) { o.color = vec3(t, i + 1, ln); colorSet = true; i += 4; }
                 else if (k == "emit" && i + 3 < t.size()) { o.emit = vec3(t, i + 1, ln); i += 4; }
@@ -1002,8 +1147,13 @@ private:
                     if (ti == w.texIds.end()) err(ln, "unknown texture '" + t[i + 1] + "' (declare it with: texture <id> <file>)");
                     else o.tex = ti->second;
                     i += 2;
+                } else if (k == "material" && i + 1 < t.size()) {
+                    if (w.materials.find(t[i + 1]) == w.materials.end()) err(ln, "unknown material '" + t[i + 1] + "' (declare it with: material <id>)");
+                    else o.material = t[i + 1];
+                    i += 2;
                 } else { err(ln, "bad spawn option '" + k + "'"); ++i; }
             }
+            if (!o.material.empty() && !colorSet) o.color = {1, 1, 1};
             if (o.tex >= 0 && !colorSet) o.color = {1, 1, 1};
             destroy(o.name);
             w.objects.push_back(o);
@@ -1014,7 +1164,17 @@ private:
         } else if (c == "set") {
             if (!need(t, 4, ln, "set <name> <property> <values>")) return;
             const std::string& p = t[2];
-            if (Object* o = findObj(t[1])) {
+            if (t[1] == "material") {
+                auto it = w.materials.find(t[2]);
+                if (it == w.materials.end()) { err(ln, "unknown material '" + t[2] + "'"); return; }
+                if (t.size() < 5) { err(ln, "usage: set material <id> <property> <value>"); return; }
+                Material updated = it->second;
+                size_t i = 3;
+                if (!materialOption(updated, t, i, ln)) return;
+                if (i != t.size()) { err(ln, "unexpected value after material property"); return; }
+                it->second = updated;
+                w.dirty = true;
+            } else if (Object* o = findObj(t[1])) {
                 if (p == "pos" && t.size() >= 6) o->pos = vec3(t, 3, ln);
                 else if (p == "rot" && t.size() >= 6) o->rot = vec3(t, 3, ln);
                 else if (p == "size" && t.size() >= 6) o->size = vec3(t, 3, ln);
@@ -1033,9 +1193,22 @@ private:
                     else err(ln, "texture filter must be linear or nearest");
                 }
                 else if (p == "collide") o->collide = isOn(t[3]);
+                else if (p == "body") {
+                    if (t[3] == "off") o->physicsEnabled = false;
+                    else if (t[3] == "static") { o->physicsEnabled = true; o->physicsDynamic = false; }
+                    else if (t[3] == "dynamic") { o->physicsEnabled = true; o->physicsDynamic = true; }
+                    else { err(ln, "body must be off, static or dynamic"); return; }
+                }
+                else if (p == "mass") o->mass = num(t[3], ln);
+                else if (p == "friction") o->friction = num(t[3], ln);
+                else if (p == "restitution") o->restitution = num(t[3], ln);
                 else if (p == "tex") {
                     if (t[3] == "none") o->tex = -1;
                     else { auto ti = w.texIds.find(t[3]); if (ti == w.texIds.end()) err(ln, "unknown texture '" + t[3] + "'"); else o->tex = ti->second; }
+                } else if (p == "material") {
+                    if (t[3] == "none") { o->material.clear(); }
+                    else if (w.materials.find(t[3]) == w.materials.end()) err(ln, "unknown material '" + t[3] + "'");
+                    else o->material = t[3];
                 } else err(ln, "bad property '" + p + "' for an object");
                 w.dirty = true;
             } else if (LightDef* l = findLight(t[1])) {

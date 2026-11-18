@@ -8,6 +8,65 @@ vec3 aces(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
+bool traceSSR(uvec2 px, vec3 p, vec3 n, vec3 direction, out ivec2 hitPixel) {
+    hitPixel = ivec2(-1);
+    vec3 origin = p + n * RAY_EPS;
+    for (int i = 0; i < 32; ++i) {
+        float t = 0.1 + 60.0 * float(i) / 31.0;
+        vec3 v = origin + direction * t - U.camPos.xyz;
+        float z = dot(v, U.camFwd.xyz);
+        if (z <= 1e-3) break;
+        vec2 ndc = vec2(dot(v, U.camRight.xyz) / (z * dot(U.camRight.xyz, U.camRight.xyz)),
+                        dot(v, U.camUp.xyz) / (z * dot(U.camUp.xyz, U.camUp.xyz)));
+        if (abs(ndc.x) >= 1.0 || abs(ndc.y) >= 1.0) break;
+        ivec2 sp = ivec2((ndc * vec2(0.5, -0.5) + 0.5) * vec2(U.misc0.xy));
+        if (all(equal(sp, ivec2(px)))) continue;
+        vec4 surface = imageLoad(gND, sp);
+        if (surface.w <= 0.0) continue;
+        float rayDist = length(v);
+        float gap = rayDist - surface.w;
+        float thickness = max(0.08, rayDist * 0.015);
+        if (gap >= 0.0 && gap < thickness && dot(surface.xyz, direction) < 0.0) {
+            hitPixel = sp;
+            return true;
+        }
+    }
+    return false;
+}
+
+vec3 blurSpecular(ivec2 centerPx) {
+    vec4 centerND = imageLoad(gND, centerPx);
+    vec4 centerMaterial = imageLoad(gMaterial, centerPx);
+    vec3 centerNormal = normalize(centerND.xyz);
+    vec3 centerSpec = imageLoad(directSpec, centerPx).rgb;
+    vec3 filtered = centerSpec * 2.0;
+    float totalWeight = 2.0;
+    float depthSigma = max(centerND.w * 0.03, 0.015);
+    const ivec2 offsets[4] = ivec2[4](
+        ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+
+    for (int i = 0; i < 4; ++i) {
+        ivec2 samplePx = centerPx + offsets[i];
+        if (any(lessThan(samplePx, ivec2(0))) ||
+            any(greaterThanEqual(samplePx, ivec2(U.misc0.xy)))) continue;
+
+        vec4 sampleND = imageLoad(gND, samplePx);
+        if (sampleND.w <= 0.0) continue;
+
+        vec4 sampleMaterial = imageLoad(gMaterial, samplePx);
+        float normalWeight = pow(max(dot(centerNormal, normalize(sampleND.xyz)), 0.0), 8.0);
+        float depthWeight = exp(-abs(centerND.w - sampleND.w) / depthSigma);
+        float materialDelta = abs(centerMaterial.x - sampleMaterial.x) +
+                              abs(centerMaterial.y - sampleMaterial.y);
+        float materialWeight = exp(-8.0 * materialDelta);
+        float weight = normalWeight * depthWeight * materialWeight;
+
+        filtered += imageLoad(directSpec, samplePx).rgb * weight;
+        totalWeight += weight;
+    }
+
+    return filtered / totalWeight;
+}
 
 void main() {
     uvec2 px = gl_GlobalInvocationID.xy;
@@ -16,17 +75,38 @@ void main() {
 
     vec4 nd  = imageLoad(gND, ip);
     vec4 alb = imageLoad(gAlbedo, ip);
+    vec4 mat = imageLoad(gMaterial, ip);
     vec3 color = vec3(0.0), lit = vec3(0.0);
 
     if (nd.w > 0.0 && alb.a > 0.5) {
         color = alb.rgb;                                       
     } else if (nd.w > 0.0) {
-        vec3 direct = imageLoad(dirCur, ip).rgb;
+        float metallic = clamp(mat.x, 0.0, 1.0);
+        vec3 direct = alb.rgb * imageLoad(dirCur, ip).rgb * (1.0 - metallic) +
+                      blurSpecular(ip);
         vec3 gi = imageLoad(giCur, ip).rgb;
-        lit = alb.rgb * (direct + gi);
+        lit = direct + alb.rgb * gi * (1.0 - metallic);
         uint mode = U.misc1.y;                                 
-        if (mode != 2u) color += alb.rgb * direct;
-        if (mode != 1u) color += alb.rgb * gi;
+        if (mode != 2u) color += direct;
+        if (mode != 1u) color += alb.rgb * gi * (1.0 - metallic);
+        if (mat.w > 0.5 && mat.y > 0.0) {
+            vec3 viewDir = primaryDir(px);
+            vec3 reflectedDir = reflect(viewDir, nd.xyz);
+            ivec2 hitPixel;
+            if (traceSSR(px, worldPos(px, nd.w), nd.xyz, reflectedDir, hitPixel)) {
+                vec4 hitAlbedo = imageLoad(gAlbedo, hitPixel);
+                vec4 hitMaterial = imageLoad(gMaterial, hitPixel);
+                vec3 reflected = hitAlbedo.a > 0.5 ? hitAlbedo.rgb
+                    : ((mode != 2u ? hitAlbedo.rgb * imageLoad(dirCur, hitPixel).rgb * (1.0 - hitMaterial.x) +
+                                      blurSpecular(hitPixel) : vec3(0.0)) +
+                       (mode != 1u ? hitAlbedo.rgb * imageLoad(giCur, hitPixel).rgb * (1.0 - hitMaterial.x) : vec3(0.0)));
+                float strength = clamp(max(mat.z, max(metallic, 0.04)) * mat.y, 0.0, 1.0);
+                vec3 f0 = mix(vec3(0.04), alb.rgb, metallic);
+                float fresnel = 1.0 - max(dot(-viewDir, nd.xyz), 0.0);
+                vec3 F = f0 + (1.0 - f0) * pow(fresnel, 5.0);
+                color += reflected * F * strength;
+            }
+        }
     } else {
         color = skyRadiance(primaryDir(px));
     }

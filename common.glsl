@@ -33,6 +33,7 @@ struct Tri {
     vec4 uv01;   
     vec4 uv2m;   
     uvec4 cache; 
+    vec4 material;
 };
 layout(set = 0, binding = 2, std430) readonly buffer TriBuf   { Tri  tris[];     };
 
@@ -90,6 +91,8 @@ layout(set = 0, binding = 15, std430) buffer TileBuf { Tile tiles[]; };
 
 struct BVHNode { vec3 bmin; float power; vec3 bmax; uint leftOrLight; uint rightOrLeaf; uint pad0, pad1, pad2; };
 layout(set = 0, binding = 25, std430) readonly buffer BVHBuf { BVHNode bvhNodes[]; };
+layout(set = 0, binding = 35, rgba16f) uniform image2D gMaterial;
+layout(set = 0, binding = 36, rgba16f) uniform image2D directSpec;
 
 
 uint pcgHash(uint v) {
@@ -192,6 +195,22 @@ vec3 triAlbedo(Tri t, vec2 b, float lod) {
     if (layer < 0) return t.albedo.rgb;
     vec2 uv = t.uv01.xy * (1.0 - b.x - b.y) + t.uv01.zw * b.x + t.uv2m.xy * b.y;
     return t.albedo.rgb * textureLod(gTex, vec3(uv, float(layer)), lod).rgb;
+}
+
+vec3 triMappedNormal(Tri t, vec2 b) {
+    vec3 n = triNormal(t);
+    int layer = int(round(t.material.x));
+    if (layer < 0) return n;
+    vec2 uv0 = t.uv01.xy, uv1 = t.uv01.zw, uv2 = t.uv2m.xy;
+    vec2 uv = uv0 * (1.0 - b.x - b.y) + uv1 * b.x + uv2 * b.y;
+    vec3 e1 = t.p1.xyz - t.p0.xyz, e2 = t.p2.xyz - t.p0.xyz;
+    vec2 d1 = uv1 - uv0, d2 = uv2 - uv0;
+    float det = d1.x * d2.y - d1.y * d2.x;
+    if (abs(det) < 1e-8) return n;
+    vec3 tangent = normalize((e1 * d2.y - e2 * d1.y) / det);
+    vec3 bitangent = normalize((e2 * d1.x - e1 * d2.x) / det);
+    vec3 mapN = pow(max(textureLod(gTex, vec3(uv, float(layer)), 0.0).rgb, vec3(0.0)), vec3(1.0 / 2.2)) * 2.0 - 1.0;
+    return normalize(tangent * mapN.x + bitangent * mapN.y + n * mapN.z);
 }
 
 float texLod(Tri t, float dist) {

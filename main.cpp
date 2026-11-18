@@ -846,8 +846,11 @@ int activeDlssMode = 0;
     
     const VkFormat F32 = VK_FORMAT_R32G32B32A32_SFLOAT, F16 = VK_FORMAT_R16G16B16A16_SFLOAT,
                    U32 = VK_FORMAT_R32G32B32A32_UINT, R8 = VK_FORMAT_R8G8B8A8_UNORM;
+    const uint32_t diW = (renderW + 1) / 2, diH = (renderH + 1) / 2;
     Image gND[2] = {createImage(renderW, renderH, F32), createImage(renderW, renderH, F32)};
     Image gAlbedo = createImage(renderW, renderH, F16);
+    Image gMaterial = createImage(renderW, renderH, F16);
+    Image directSpec = createImage(renderW, renderH, F16, VK_IMAGE_USAGE_SAMPLED_BIT);
     Image resInit = createImage(renderW, renderH, U32, VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     Image resT[2] = {createImage(renderW, renderH, U32), createImage(renderW, renderH, U32)};
     Image resSpatial = createImage(renderW, renderH, U32);
@@ -863,15 +866,25 @@ int activeDlssMode = 0;
     Image nrdViewZ = createImage(renderW, renderH, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT);
     Image nrdDIOutput = createImage(renderW, renderH, F16, VK_IMAGE_USAGE_SAMPLED_BIT);
     Image nrdGIOutput = createImage(renderW, renderH, F16, VK_IMAGE_USAGE_SAMPLED_BIT);
+    Image nrdSpecOutput = createImage(renderW, renderH, F16, VK_IMAGE_USAGE_SAMPLED_BIT);
+    Image nrdDIHalfInput = createImage(diW, diH, F16);
+    Image nrdDIHalfSpecInput = createImage(diW, diH, F16);
+    Image nrdDIHalfMotion = createImage(diW, diH, VK_FORMAT_R16G16_SFLOAT);
+    Image nrdDIHalfNormalRoughness = createImage(diW, diH, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    Image nrdDIHalfViewZ = createImage(diW, diH, VK_FORMAT_R32_SFLOAT);
+    Image nrdDIHalfOutput = createImage(diW, diH, F16);
+    Image nrdDIHalfSpecOutput = createImage(diW, diH, F16);
     Image finalImg = createImage(renderW, renderH, R8, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     Image dlssOutput{};
 #ifdef RTENGINE_HAS_DLSS
     if (dlssActive) dlssOutput = createImage(W, H, R8, VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 #endif
-    std::vector<VkImage> allImages = {gND[0].img, gND[1].img, gAlbedo.img, resInit.img, resT[0].img, resT[1].img,
+    std::vector<VkImage> allImages = {gND[0].img, gND[1].img, gAlbedo.img, gMaterial.img, directSpec.img, resInit.img, resT[0].img, resT[1].img,
                                       resSpatial.img, gi[0].img, gi[1].img, dirAcc[0].img, dirAcc[1].img, lit[0].img, lit[1].img,
                                       nrdRawDI.img, nrdRawGI.img, nrdDIInput.img, nrdGIInput.img, nrdMotion.img,
-                                      nrdNormalRoughness.img, nrdViewZ.img, nrdDIOutput.img, nrdGIOutput.img, finalImg.img};
+                                      nrdNormalRoughness.img, nrdViewZ.img, nrdDIOutput.img, nrdGIOutput.img, nrdSpecOutput.img,
+                                      nrdDIHalfInput.img, nrdDIHalfSpecInput.img, nrdDIHalfMotion.img, nrdDIHalfNormalRoughness.img,
+                                      nrdDIHalfViewZ.img, nrdDIHalfOutput.img, nrdDIHalfSpecOutput.img, finalImg.img};
 #ifdef RTENGINE_HAS_DLSS
     if (dlssActive) allImages.push_back(dlssOutput.img);
 #endif
@@ -895,7 +908,7 @@ int activeDlssMode = 0;
     }
 
     
-    const uint32_t NB = 35;
+    const uint32_t NB = 44;
     auto isStorageBuf = [](uint32_t i) { return i == 2 || i == 3 || i == 14 || i == 15 || (i >= 19 && i <= 22) || i == 25; };
     std::array<VkDescriptorSetLayoutBinding, NB> lb{};
     for (uint32_t i = 0; i < NB; ++i) {
@@ -911,7 +924,7 @@ int activeDlssMode = 0;
     VK(vkCreateDescriptorSetLayout(g_dev, &dli, nullptr, &dsl));
 
     std::array<VkDescriptorPoolSize, 5> dps = {{{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
-                                                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 36}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 92},
+                                                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 36}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128},
                                                 {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4}}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 4; dpi.poolSizeCount = (uint32_t)dps.size(); dpi.pPoolSizes = dps.data();
@@ -951,12 +964,20 @@ int activeDlssMode = 0;
                                    nrdNormalRoughness.view, nrdViewZ.view, nrdDIOutput.view, nrdGIOutput.view};
         VkDescriptorImageInfo nrdImgInfo[9];
         for (int i = 0; i < 9; ++i) nrdImgInfo[i] = {VK_NULL_HANDLE, nrdViews[i], VK_IMAGE_LAYOUT_GENERAL};
+        VkImageView nrdDIHalfViews[7] = {nrdDIHalfInput.view, nrdDIHalfSpecInput.view, nrdDIHalfMotion.view,
+                                         nrdDIHalfNormalRoughness.view, nrdDIHalfViewZ.view, nrdDIHalfOutput.view,
+                                         nrdDIHalfSpecOutput.view};
+        VkDescriptorImageInfo nrdDIHalfImgInfo[7];
+        for (int i = 0; i < 7; ++i) nrdDIHalfImgInfo[i] = {VK_NULL_HANDLE, nrdDIHalfViews[i], VK_IMAGE_LAYOUT_GENERAL};
         VkDescriptorImageInfo texInfo{texArray.sampler, texArray.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo materialInfo{VK_NULL_HANDLE, gMaterial.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo directSpecInfo{VK_NULL_HANDLE, directSpec.view, VK_IMAGE_LAYOUT_GENERAL};
 
         for (int variant = 0; variant < 2; ++variant) {
             if (variant == 1) {
                 imgInfo[7].imageView = nrdGIOutput.view;
                 imgInfo[10].imageView = nrdDIOutput.view;
+                directSpecInfo.imageView = nrdSpecOutput.view;
             }
             std::vector<VkWriteDescriptorSet> w(NB);
             for (uint32_t i = 0; i < NB; ++i) {
@@ -966,6 +987,9 @@ int activeDlssMode = 0;
                 if (i == 0) w[i].pNext = &asw;
                 else if (i == 1 || isStorageBuf(i)) w[i].pBufferInfo = &bufInfo[i];
                 else if (i == 18) w[i].pImageInfo = &texInfo;
+                else if (i == 35) w[i].pImageInfo = &materialInfo;
+                else if (i == 36) w[i].pImageInfo = &directSpecInfo;
+                else if (i >= 37) w[i].pImageInfo = &nrdDIHalfImgInfo[i - 37];
                 else if (i >= 26) w[i].pImageInfo = &nrdImgInfo[i - 26];
                 else w[i].pImageInfo = &imgInfo[i <= 13 ? i - 4 : (i <= 17 ? i - 6 : i - 11)];
             }
@@ -1000,9 +1024,17 @@ int activeDlssMode = 0;
     VkPipeline nrdPrepPipe;
     VK(vkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &nrdPrepPipelineInfo, nullptr, &nrdPrepPipe));
     vkDestroyShaderModule(g_dev, nrdPrepModule, nullptr);
+    VkShaderModule nrdDIUpsampleModule = loadShader(shaderDir / "nrd_di_upsample.comp.spv");
+    VkComputePipelineCreateInfo nrdDIUpsamplePipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    nrdDIUpsamplePipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
+                                       nrdDIUpsampleModule, "main", nullptr};
+    nrdDIUpsamplePipelineInfo.layout = playout;
+    VkPipeline nrdDIUpsamplePipe;
+    VK(vkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &nrdDIUpsamplePipelineInfo, nullptr, &nrdDIUpsamplePipe));
+    vkDestroyShaderModule(g_dev, nrdDIUpsampleModule, nullptr);
 
     constexpr nrd::Identifier nrdDIId = 1, nrdGIId = 2;
-    const nrd::DenoiserDesc nrdDIDenoiser{nrdDIId, nrd::Denoiser::RELAX_DIFFUSE};
+    const nrd::DenoiserDesc nrdDIDenoiser{nrdDIId, nrd::Denoiser::RELAX_DIFFUSE_SPECULAR};
     const nrd::DenoiserDesc nrdGIDenoiser{nrdGIId, nrd::Denoiser::REBLUR_DIFFUSE};
     nrd::InstanceCreationDesc nrdDIInstanceDesc{};
     nrdDIInstanceDesc.denoisers = &nrdDIDenoiser;
@@ -1034,7 +1066,10 @@ int activeDlssMode = 0;
     nrdDeviceDesc.queueFamilyNum = 1;
     nrdDeviceDesc.minorVersion = 2;
     nrd::Integration nrdDIIntegration, nrdGIIntegration;
-    nrd::Result nrdResult = nrdDIIntegration.RecreateVK(nrdIntegrationDesc, nrdDIInstanceDesc, nrdDeviceDesc);
+    nrd::IntegrationCreationDesc nrdDIIntegrationDesc = nrdIntegrationDesc;
+    nrdDIIntegrationDesc.resourceWidth = static_cast<uint16_t>(diW);
+    nrdDIIntegrationDesc.resourceHeight = static_cast<uint16_t>(diH);
+    nrd::Result nrdResult = nrdDIIntegration.RecreateVK(nrdDIIntegrationDesc, nrdDIInstanceDesc, nrdDeviceDesc);
     if (nrdResult != nrd::Result::SUCCESS) {
         std::fprintf(stderr, "NRD DI initialization failed (%u)\n", static_cast<uint32_t>(nrdResult));
         return 1;
@@ -1045,12 +1080,15 @@ int activeDlssMode = 0;
         return 1;
     }
     nrd::RelaxSettings nrdDISettings{};  
-    nrdDISettings.diffuseMaxAccumulatedFrameNum = 20;
+    nrdDISettings.diffuseMaxAccumulatedFrameNum = 30;
     nrdDISettings.diffuseMaxFastAccumulatedFrameNum = 6;
+    nrdDISettings.specularMaxAccumulatedFrameNum = 30;
+    nrdDISettings.specularMaxFastAccumulatedFrameNum = 6;
+    nrdDISettings.atrousIterationNum = 4;
     nrd::ReblurSettings nrdGISettings{};
     nrdGISettings.maxAccumulatedFrameNum = 30;
     nrdGISettings.maxFastAccumulatedFrameNum = 6;
-    nrdGISettings.maxStabilizedFrameNum = 30;
+    nrdGISettings.maxStabilizedFrameNum = 0;
     nrdResult = nrdDIIntegration.SetDenoiserSettings(nrdDIId, &nrdDISettings);
     if (nrdResult != nrd::Result::SUCCESS) {
         std::fprintf(stderr, "NRD DI configuration failed (%u)\n", static_cast<uint32_t>(nrdResult));
@@ -1308,6 +1346,7 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
         }
         for (int k : script.keys()) if (k != GLFW_KEY_F5 && edge[k]) script.fireKey(k);
         script.update(dt);
+        world.updatePhysics(dt);
         if (world.camChanged) {                          
             cam.pos = world.camPos;
             cam.yaw = world.camYaw * kPi / 180.0f;
@@ -1380,27 +1419,31 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
         if (nrdEnabled) {
             nrdDIIntegration.NewFrame();
             nrdGIIntegration.NewFrame();
-            nrd::CommonSettings nrdCommon{};
-            setViewToClip(nrdCommon.viewToClipMatrix, tanHalf, aspect);
-            std::memcpy(nrdCommon.viewToClipMatrixPrev, nrdCommon.viewToClipMatrix, sizeof(nrdCommon.viewToClipMatrix));
-            setWorldToView(nrdCommon.worldToViewMatrix, cam);
-            setWorldToView(nrdCommon.worldToViewMatrixPrev, lastCam);
-            nrdCommon.resourceSize[0] = nrdCommon.resourceSizePrev[0] = static_cast<uint16_t>(renderW);
-            nrdCommon.resourceSize[1] = nrdCommon.resourceSizePrev[1] = static_cast<uint16_t>(renderH);
-            nrdCommon.rectSize[0] = nrdCommon.rectSizePrev[0] = static_cast<uint16_t>(renderW);
-            nrdCommon.rectSize[1] = nrdCommon.rectSizePrev[1] = static_cast<uint16_t>(renderH);
-            nrdCommon.motionVectorScale[0] = nrdCommon.motionVectorScale[1] = 1.0f;
-            nrdCommon.cameraJitter[0] = u.jitter[0];
-            nrdCommon.cameraJitter[1] = u.jitter[1];
-            nrdCommon.cameraJitterPrev[0] = u.jitter[2];
-            nrdCommon.cameraJitterPrev[1] = u.jitter[3];
-            nrdCommon.denoisingRange = 50000.0f;
-            nrdCommon.timeDeltaBetweenFrames = dt * 1000.0f;
-            nrdCommon.frameIndex = frame;
-            nrdCommon.accumulationMode = (!nrdWasEnabled || frame == 0)
-                ? nrd::AccumulationMode::CLEAR_AND_RESTART : nrd::AccumulationMode::CONTINUE;
-            if (nrdDIIntegration.SetCommonSettings(nrdCommon) != nrd::Result::SUCCESS ||
-                nrdGIIntegration.SetCommonSettings(nrdCommon) != nrd::Result::SUCCESS) {
+            auto setNrdCommon = [&](nrd::CommonSettings& settings, uint32_t width, uint32_t height) {
+                setViewToClip(settings.viewToClipMatrix, tanHalf, aspect);
+                std::memcpy(settings.viewToClipMatrixPrev, settings.viewToClipMatrix, sizeof(settings.viewToClipMatrix));
+                setWorldToView(settings.worldToViewMatrix, cam);
+                setWorldToView(settings.worldToViewMatrixPrev, lastCam);
+                settings.resourceSize[0] = settings.resourceSizePrev[0] = static_cast<uint16_t>(width);
+                settings.resourceSize[1] = settings.resourceSizePrev[1] = static_cast<uint16_t>(height);
+                settings.rectSize[0] = settings.rectSizePrev[0] = static_cast<uint16_t>(width);
+                settings.rectSize[1] = settings.rectSizePrev[1] = static_cast<uint16_t>(height);
+                settings.motionVectorScale[0] = settings.motionVectorScale[1] = 1.0f;
+                settings.cameraJitter[0] = u.jitter[0] / renderW;
+                settings.cameraJitter[1] = u.jitter[1] / renderH;
+                settings.cameraJitterPrev[0] = u.jitter[2] / renderW;
+                settings.cameraJitterPrev[1] = u.jitter[3] / renderH;
+                settings.denoisingRange = 50000.0f;
+                settings.timeDeltaBetweenFrames = dt * 1000.0f;
+                settings.frameIndex = frame;
+                settings.accumulationMode = (!nrdWasEnabled || frame == 0)
+                    ? nrd::AccumulationMode::CLEAR_AND_RESTART : nrd::AccumulationMode::CONTINUE;
+            };
+            nrd::CommonSettings nrdDICommon{}, nrdGICommon{};
+            setNrdCommon(nrdDICommon, diW, diH);
+            setNrdCommon(nrdGICommon, renderW, renderH);
+            if (nrdDIIntegration.SetCommonSettings(nrdDICommon) != nrd::Result::SUCCESS ||
+                nrdGIIntegration.SetCommonSettings(nrdGICommon) != nrd::Result::SUCCESS) {
                 std::fprintf(stderr, "NRD common settings rejected\n");
                 return 1;
             }
@@ -1536,14 +1579,17 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
             nrd::ResourceSnapshot diSnapshot;
             nrd::ResourceSnapshot giSnapshot;
             diSnapshot.restoreInitialState = giSnapshot.restoreInitialState = true;
+            diSnapshot.SetResource(nrd::ResourceType::IN_MV, makeNrdResource(nrdDIHalfMotion, VK_FORMAT_R16G16_SFLOAT));
+            diSnapshot.SetResource(nrd::ResourceType::IN_NORMAL_ROUGHNESS,
+                                   makeNrdResource(nrdDIHalfNormalRoughness, VK_FORMAT_A2B10G10R10_UNORM_PACK32));
+            diSnapshot.SetResource(nrd::ResourceType::IN_VIEWZ, makeNrdResource(nrdDIHalfViewZ, VK_FORMAT_R32_SFLOAT));
+            diSnapshot.SetResource(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, makeNrdResource(nrdDIHalfInput, F16));
+            diSnapshot.SetResource(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, makeNrdResource(nrdDIHalfOutput, F16));
+            diSnapshot.SetResource(nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, makeNrdResource(nrdDIHalfSpecInput, F16));
+            diSnapshot.SetResource(nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, makeNrdResource(nrdDIHalfSpecOutput, F16));
             nrd::Resource motion = makeNrdResource(nrdMotion, VK_FORMAT_R16G16_SFLOAT);
             nrd::Resource normalRoughness = makeNrdResource(nrdNormalRoughness, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
             nrd::Resource viewZ = makeNrdResource(nrdViewZ, VK_FORMAT_R32_SFLOAT);
-            diSnapshot.SetResource(nrd::ResourceType::IN_MV, motion);
-            diSnapshot.SetResource(nrd::ResourceType::IN_NORMAL_ROUGHNESS, normalRoughness);
-            diSnapshot.SetResource(nrd::ResourceType::IN_VIEWZ, viewZ);
-            diSnapshot.SetResource(nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, makeNrdResource(nrdDIInput, F16));
-            diSnapshot.SetResource(nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, makeNrdResource(nrdDIOutput, F16));
             giSnapshot.SetResource(nrd::ResourceType::IN_MV, motion);
             giSnapshot.SetResource(nrd::ResourceType::IN_NORMAL_ROUGHNESS, normalRoughness);
             giSnapshot.SetResource(nrd::ResourceType::IN_VIEWZ, viewZ);
@@ -1555,6 +1601,16 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
             nrdCommandBuffer.queueType = nri::QueueType::GRAPHICS;
             nrdDIIntegration.DenoiseVK(&nrdDIId, 1, nrdCommandBuffer, diSnapshot);
             nrdGIIntegration.DenoiseVK(&nrdGIId, 1, nrdCommandBuffer, giSnapshot);
+            VkMemoryBarrier diUpsampleBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            diUpsampleBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            diUpsampleBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &diUpsampleBarrier, 0, nullptr, 0, nullptr);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, nrdDIUpsamplePipe);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, playout, 0, 1, &compositeSets[frame & 1], 0, nullptr);
+            vkCmdDispatch(cmd, gx, gy, 1);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &mb, 0, nullptr, 0, nullptr);
         }
         if (i == 8) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qpool, 10);
     }

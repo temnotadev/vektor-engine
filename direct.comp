@@ -13,26 +13,51 @@ void main() {
 
     vec4 nd  = imageLoad(gND, ip);
     vec4 alb = imageLoad(gAlbedo, ip);
+    vec4 mat = imageLoad(gMaterial, ip);
     if (nd.w <= 0.0 || alb.a > 0.5) {
         imageStore(dirCur, ip, vec4(0.0));
         imageStore(nrdRawDI, ip, vec4(0.0));
+        imageStore(directSpec, ip, vec4(0.0));
         return;
     }
 
     vec3 n = nd.xyz;
     vec3 p = worldPos(px, nd.w);
+    vec3 v = normalize(U.camPos.xyz - p);
 
     vec3 Ld = vec3(0.0);
+    vec3 Ls = vec3(0.0);
     float hitDist = 0.0;
     Res r = unpackRes(imageLoad(resSpatial, ip));
     if (r.light != NO_LIGHT && r.W > 0.0) {
         LightEval e = evalLight(r.light, r.u, p, n);
         hitDist = e.dist;
-        Ld = e.f * r.W * (1.0 / PI);
+        float noL = max(dot(n, e.wi), 0.0);
+        float noV = max(dot(n, v), 1e-4);
+        if (noL > 0.0) {
+            vec3 h = normalize(e.wi + v);
+            float noH = max(dot(n, h), 0.0);
+            float voH = max(dot(v, h), 0.0);
+            float roughness = max(1.0 - mat.y, 0.045);
+            float alpha = roughness * roughness;
+            float alpha2 = alpha * alpha;
+            float denom = noH * noH * (alpha2 - 1.0) + 1.0;
+            float D = alpha2 / max(PI * denom * denom, 1e-6);
+            float gv = 2.0 * noV / (noV + sqrt(alpha2 + (1.0 - alpha2) * noV * noV));
+            float gl = 2.0 * noL / (noL + sqrt(alpha2 + (1.0 - alpha2) * noL * noL));
+            vec3 f0 = mix(vec3(0.04), alb.rgb, clamp(mat.x, 0.0, 1.0));
+            vec3 F = f0 + (1.0 - f0) * pow(1.0 - voH, 5.0);
+            vec3 specular = D * gv * gl * F / max(4.0 * noV * noL, 1e-5);
+            Ld = e.f * r.W * (1.0 / PI);
+            Ls = e.f * r.W / noL * specular;
+        }
     }
     float l = luminance(Ld);
     if (l > 50.0) Ld *= 50.0 / l;                              
+    l = luminance(Ls);
+    if (l > 50.0) Ls *= 50.0 / l;
     imageStore(nrdRawDI, ip, vec4(Ld, hitDist));
+    imageStore(directSpec, ip, vec4(Ls, hitDist));
 
     vec4 outv = vec4(Ld, 1.0);
     ivec2 pp;
