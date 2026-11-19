@@ -114,6 +114,7 @@ struct Material {
 struct LightDef {
     std::string name; uint32_t type = LIGHT_POINT;
     V3 pos{0, 0, 0}, dir{0, -1, 0}, color{1, 1, 1};
+    float intensity = 1.0f;                                            
     float radius = 0.03f, range = 5.0f, inner = 20.0f, outer = 35.0f;   
     bool strictAttenuation = false;
 };
@@ -757,8 +758,10 @@ inline void buildScene(const World& w, Scene& s) {
         if (s.lights.size() >= MAX_LIGHTS) { s.truncated = true; break; }
         GpuLight L{};
         setF3(L.pos, d.pos); L.radius = std::max(d.radius, 0.001f); setF3(L.dir, normalize(d.dir));
-        L.type = d.type; setF3(L.color, d.color); L.range = std::max(d.range, 0.01f);
-        L.power = lum(d.color);
+        L.type = d.type; L.range = std::max(d.range, 0.01f);
+        V3 lightColor = d.color * std::max(d.intensity, 0.0f);
+        setF3(L.color, lightColor);
+        L.power = lum(lightColor);
         L.strictAttenuation = d.strictAttenuation ? 1u : 0u;
         if (d.type == LIGHT_SPOT) { L.cosOuter = std::cos(d.outer * kPi / 180); L.cosInner = std::cos(d.inner * kPi / 180); }
         if (d.type == LIGHT_DIR)  { L.cosOuter = std::cos(d.outer * kPi / 180); L.range = 1e9f; }
@@ -1215,6 +1218,7 @@ private:
                 if (p == "pos" && t.size() >= 6) l->pos = vec3(t, 3, ln);
                 else if (p == "dir" && t.size() >= 6) l->dir = vec3(t, 3, ln);
                 else if (p == "color" && t.size() >= 6) l->color = vec3(t, 3, ln);
+                else if (p == "intensity") l->intensity = std::max(0.0f, num(t[3], ln));
                 else if (p == "range") l->range = num(t[3], ln);
                 else if (p == "radius") l->radius = num(t[3], ln);
                 else if (p == "strict" && l->type == LIGHT_POINT) {
@@ -1236,21 +1240,35 @@ private:
             l.name = t[2];
             if (!l.name.empty() && l.name.back() == '#') l.name = l.name.substr(0, l.name.size() - 1) + std::to_string(++w.spawnCounter);
             if (t[1] == "point") {
-                if (!need(t, 10, ln, "light point <name> x y z r g b range [radius] [strict]")) return;
+                if (!need(t, 10, ln, "light point <name> x y z r g b range [radius] [strict] [intensity v]")) return;
                 l.type = LIGHT_POINT; l.pos = vec3(t, 3, ln); l.color = vec3(t, 6, ln); l.range = num(t[9], ln);
                 for (size_t i = 10; i < t.size(); ++i) {
-                    if (t[i] == "strict") l.strictAttenuation = true;
+                    if (t[i] == "strict") {
+                        l.strictAttenuation = true;
+                        if (i + 1 < t.size() && (t[i + 1] == "on" || t[i + 1] == "off"))
+                            l.strictAttenuation = t[++i] == "on";
+                    }
+                    else if (t[i] == "intensity" && i + 1 < t.size()) l.intensity = std::max(0.0f, num(t[++i], ln));
                     else if (i == 10) l.radius = num(t[i], ln);
-                    else { err(ln, "point light option must be a radius or strict"); return; }
+                    else { err(ln, "point light option must be a radius, strict, or intensity"); return; }
                 }
             } else if (t[1] == "spot") {
-                if (!need(t, 14, ln, "light spot <name> x y z dx dy dz r g b range outerDeg innerDeg [radius]")) return;
+                if (!need(t, 14, ln, "light spot <name> x y z dx dy dz r g b range outerDeg innerDeg [radius] [intensity v]")) return;
                 l.type = LIGHT_SPOT; l.pos = vec3(t, 3, ln); l.dir = vec3(t, 6, ln); l.color = vec3(t, 9, ln);
                 l.range = num(t[12], ln); l.outer = num(t[13], ln); l.inner = t.size() > 14 ? num(t[14], ln) : l.outer * 0.6f;
-                if (t.size() > 15) l.radius = num(t[15], ln);
+                for (size_t i = 15; i < t.size(); ++i) {
+                    if (t[i] == "intensity" && i + 1 < t.size()) l.intensity = std::max(0.0f, num(t[++i], ln));
+                    else if (i == 15) l.radius = num(t[i], ln);
+                    else { err(ln, "spot light option must be a radius or intensity"); return; }
+                }
             } else if (t[1] == "sun") {
-                if (!need(t, 9, ln, "light sun <name> dx dy dz r g b [angularRadiusDeg]")) return;
-                l.type = LIGHT_DIR; l.dir = vec3(t, 3, ln); l.color = vec3(t, 6, ln); l.outer = t.size() > 9 ? num(t[9], ln) : 0.5f;
+                if (!need(t, 9, ln, "light sun <name> dx dy dz r g b [angularRadiusDeg] [intensity v]")) return;
+                l.type = LIGHT_DIR; l.dir = vec3(t, 3, ln); l.color = vec3(t, 6, ln); l.outer = 0.5f;
+                for (size_t i = 9; i < t.size(); ++i) {
+                    if (t[i] == "intensity" && i + 1 < t.size()) l.intensity = std::max(0.0f, num(t[++i], ln));
+                    else if (i == 9) l.outer = num(t[i], ln);
+                    else { err(ln, "sun light option must be an angular radius or intensity"); return; }
+                }
             } else { err(ln, "light type must be point, spot or sun"); return; }
             destroy(l.name);
             w.lights.push_back(l);
@@ -1437,7 +1455,7 @@ private:
                 V3 col{sat(std::fabs(h * 6 - 3) - 1) * 0.7f + 0.3f, sat(2 - std::fabs(h * 6 - 2)) * 0.7f + 0.3f, sat(2 - std::fabs(h * 6 - 4)) * 0.7f + 0.3f};
                 LightDef l;
                 l.name = "pl" + std::to_string(placed);
-                l.type = LIGHT_POINT; l.pos = {x, y, z}; l.color = col * (8.0f / float(n)); l.radius = 0.03f; l.range = 4.0f;
+                l.type = LIGHT_POINT; l.pos = {x, y, z}; l.color = col * (8.0f / float(n)); l.radius = 0.03f; l.range = 4.0f; l.intensity = 20.0f; l.strictAttenuation = false;
                 w.lights.push_back(l);
                 ++placed;
             }

@@ -1079,15 +1079,15 @@ int activeDlssMode = 0;
         std::fprintf(stderr, "NRD GI initialization failed (%u)\n", static_cast<uint32_t>(nrdResult));
         return 1;
     }
-    nrd::RelaxSettings nrdDISettings{};  
+    nrd::RelaxSettings nrdDISettings{};
     nrdDISettings.diffuseMaxAccumulatedFrameNum = 30;
-    nrdDISettings.diffuseMaxFastAccumulatedFrameNum = 6;
+    nrdDISettings.diffuseMaxFastAccumulatedFrameNum = 5;
     nrdDISettings.specularMaxAccumulatedFrameNum = 30;
     nrdDISettings.specularMaxFastAccumulatedFrameNum = 6;
     nrdDISettings.atrousIterationNum = 4;
     nrd::ReblurSettings nrdGISettings{};
-    nrdGISettings.maxAccumulatedFrameNum = 30;
-    nrdGISettings.maxFastAccumulatedFrameNum = 6;
+    nrdGISettings.maxAccumulatedFrameNum = 5;
+    nrdGISettings.maxFastAccumulatedFrameNum = 2;
     nrdGISettings.maxStabilizedFrameNum = 0;
     nrdResult = nrdDIIntegration.SetDenoiserSettings(nrdDIId, &nrdDISettings);
     if (nrdResult != nrd::Result::SUCCESS) {

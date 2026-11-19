@@ -17,6 +17,8 @@ if(NOT glfw3_FOUND)
   FetchContent_MakeAvailable(glfw)
 endif()
 
+set(REBLUR_PERFORMANCE_MODE ON CACHE BOOL "" FORCE)
+
 # denoiser nrd integration
 include(FetchContent)
 set(NRD_STATIC_LIBRARY ON CACHE BOOL "" FORCE)
