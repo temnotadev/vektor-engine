@@ -309,6 +309,7 @@ struct FrameUBO {
     float skyZenith[4];
     float skyHorizon[4];
     float jitter[4];
+    float ssrParams[4];   // x = ssrOpacity, y = ssr edge fade width, z = ssr temporal weight
 };
 
 struct Camera { V3 pos{0, 2.5f, 8.5f}; float yaw = 0, pitch = 0; };   
@@ -445,6 +446,8 @@ int main(int argc, char** argv) {
     if (!std::filesystem::exists(shaderDir)) shaderDir = exeDir.parent_path() / "shaders";
 
     World world;
+    if (!world.audio.init())
+        std::fprintf(stderr, "audio: continuing without sound\n");
     Script script(world);
     world.assetDirs.push_back(exeDir.string());
     {
@@ -874,6 +877,10 @@ int activeDlssMode = 0;
     Image nrdDIHalfViewZ = createImage(diW, diH, VK_FORMAT_R32_SFLOAT);
     Image nrdDIHalfOutput = createImage(diW, diH, F16);
     Image nrdDIHalfSpecOutput = createImage(diW, diH, F16);
+    Image ssrHalf = createImage(diW, diH, F16);   // final blurred SSR (binding 45)
+    Image ssrRaw  = createImage(diW, diH, F16);   // SSR trace output (binding 46)
+    Image ssrTmp  = createImage(diW, diH, F16);   // blur ping-pong (binding 47)
+    Image ssrHist[2] = {createImage(diW, diH, F16), createImage(diW, diH, F16)};   // SSR temporal history, ping-pong (bindings 48 cur / 49 prev)
     Image finalImg = createImage(renderW, renderH, R8, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     Image dlssOutput{};
 #ifdef RTENGINE_HAS_DLSS
@@ -884,7 +891,7 @@ int activeDlssMode = 0;
                                       nrdRawDI.img, nrdRawGI.img, nrdDIInput.img, nrdGIInput.img, nrdMotion.img,
                                       nrdNormalRoughness.img, nrdViewZ.img, nrdDIOutput.img, nrdGIOutput.img, nrdSpecOutput.img,
                                       nrdDIHalfInput.img, nrdDIHalfSpecInput.img, nrdDIHalfMotion.img, nrdDIHalfNormalRoughness.img,
-                                      nrdDIHalfViewZ.img, nrdDIHalfOutput.img, nrdDIHalfSpecOutput.img, finalImg.img};
+                                      nrdDIHalfViewZ.img, nrdDIHalfOutput.img, nrdDIHalfSpecOutput.img, ssrHalf.img, ssrRaw.img, ssrTmp.img, ssrHist[0].img, ssrHist[1].img, finalImg.img};
 #ifdef RTENGINE_HAS_DLSS
     if (dlssActive) allImages.push_back(dlssOutput.img);
 #endif
@@ -895,7 +902,8 @@ int activeDlssMode = 0;
             VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image = im; b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            b.image = im;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             bars.push_back(b);
         }
@@ -908,7 +916,7 @@ int activeDlssMode = 0;
     }
 
     
-    const uint32_t NB = 44;
+    const uint32_t NB = 50;   // 44 = unused filler, 45 = uSSRHalf, 46 = uSSRRaw, 47 = uSSRTmp, 48 = uSSRHistCur, 49 = uSSRHistPrev
     auto isStorageBuf = [](uint32_t i) { return i == 2 || i == 3 || i == 14 || i == 15 || (i >= 19 && i <= 22) || i == 25; };
     std::array<VkDescriptorSetLayoutBinding, NB> lb{};
     for (uint32_t i = 0; i < NB; ++i) {
@@ -924,7 +932,7 @@ int activeDlssMode = 0;
     VK(vkCreateDescriptorSetLayout(g_dev, &dli, nullptr, &dsl));
 
     std::array<VkDescriptorPoolSize, 5> dps = {{{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 4}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
-                                                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 36}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128},
+                                                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 36}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 160},
                                                 {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4}}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 4; dpi.poolSizeCount = (uint32_t)dps.size(); dpi.pPoolSizes = dps.data();
@@ -972,6 +980,11 @@ int activeDlssMode = 0;
         VkDescriptorImageInfo texInfo{texArray.sampler, texArray.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkDescriptorImageInfo materialInfo{VK_NULL_HANDLE, gMaterial.view, VK_IMAGE_LAYOUT_GENERAL};
         VkDescriptorImageInfo directSpecInfo{VK_NULL_HANDLE, directSpec.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo ssrHalfInfo{VK_NULL_HANDLE, ssrHalf.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo ssrRawInfo{VK_NULL_HANDLE, ssrRaw.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo ssrTmpInfo{VK_NULL_HANDLE, ssrTmp.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo ssrHistCurInfo{VK_NULL_HANDLE, ssrHist[cur].view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo ssrHistPrevInfo{VK_NULL_HANDLE, ssrHist[prev].view, VK_IMAGE_LAYOUT_GENERAL};
 
         for (int variant = 0; variant < 2; ++variant) {
             if (variant == 1) {
@@ -989,6 +1002,11 @@ int activeDlssMode = 0;
                 else if (i == 18) w[i].pImageInfo = &texInfo;
                 else if (i == 35) w[i].pImageInfo = &materialInfo;
                 else if (i == 36) w[i].pImageInfo = &directSpecInfo;
+                else if (i == 44 || i == 45) w[i].pImageInfo = &ssrHalfInfo;   // 44 is just a filler
+                else if (i == 46) w[i].pImageInfo = &ssrRawInfo;
+                else if (i == 47) w[i].pImageInfo = &ssrTmpInfo;
+                else if (i == 48) w[i].pImageInfo = &ssrHistCurInfo;
+                else if (i == 49) w[i].pImageInfo = &ssrHistPrevInfo;
                 else if (i >= 37) w[i].pImageInfo = &nrdDIHalfImgInfo[i - 37];
                 else if (i >= 26) w[i].pImageInfo = &nrdImgInfo[i - 26];
                 else w[i].pImageInfo = &imgInfo[i <= 13 ? i - 4 : (i <= 17 ? i - 6 : i - 11)];
@@ -1032,6 +1050,28 @@ int activeDlssMode = 0;
     VkPipeline nrdDIUpsamplePipe;
     VK(vkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &nrdDIUpsamplePipelineInfo, nullptr, &nrdDIUpsamplePipe));
     vkDestroyShaderModule(g_dev, nrdDIUpsampleModule, nullptr);
+    VkShaderModule ssrModule = loadShader(shaderDir / "ssr_half.comp.spv");
+    VkComputePipelineCreateInfo ssrPipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ssrPipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
+                             ssrModule, "main", nullptr};
+    ssrPipelineInfo.layout = playout;
+    VkPipeline ssrPipe;
+    VK(vkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &ssrPipelineInfo, nullptr, &ssrPipe));
+    vkDestroyShaderModule(g_dev, ssrModule, nullptr);
+    // SSR filter chain: one shader, three pipelines (pass = specialization constant 0).
+    VkShaderModule ssrBlurModule = loadShader(shaderDir / "ssr_blur.comp.spv");
+    // pass 0 = horizontal, 1 = vertical, 2 = temporal resolve (same shader, see ssr_blur.comp)
+    VkPipeline ssrBlurPipe[3];
+    for (uint32_t dir = 0; dir < 3; ++dir) {
+        VkSpecializationMapEntry specEntry{0, 0, sizeof(uint32_t)};
+        VkSpecializationInfo specInfo{1, &specEntry, sizeof(uint32_t), &dir};
+        VkComputePipelineCreateInfo blurInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        blurInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
+                          ssrBlurModule, "main", &specInfo};
+        blurInfo.layout = playout;
+        VK(vkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &blurInfo, nullptr, &ssrBlurPipe[dir]));
+    }
+    vkDestroyShaderModule(g_dev, ssrBlurModule, nullptr);
 
     constexpr nrd::Identifier nrdDIId = 1, nrdGIId = 2;
     const nrd::DenoiserDesc nrdDIDenoiser{nrdDIId, nrd::Denoiser::RELAX_DIFFUSE_SPECULAR};
@@ -1346,6 +1386,18 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
         }
         for (int k : script.keys()) if (k != GLFW_KEY_F5 && edge[k]) script.fireKey(k);
         script.update(dt);
+        // Positional sounds: attenuate by distance and pan relative to the camera.
+        for (auto& s : world.sounds) {
+            if (!s.spatial || !world.audio.isPlaying(s.name)) continue;
+            V3 delta = s.pos - cam.pos;
+            float dist = length(delta);
+            float r = std::max(s.range, 0.01f);
+            float atten = 1.0f / (1.0f + (dist / r) * (dist / r));
+            Basis sb = basisOf(cam);
+            float pan = dist > 1e-4f ? std::clamp(dot(delta * (1.0f / dist), sb.right), -1.0f, 1.0f) : 0.0f;
+            world.audio.setVolume(s.name, s.volume * atten);
+            world.audio.setPan(s.name, pan);
+        }
         world.updatePhysics(dt);
         if (world.camChanged) {                          
             cam.pos = world.camPos;
@@ -1390,7 +1442,8 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
         u.misc3[2] = 2; u.misc3[3] = world.giOffscreenRate;                       
         u.misc4[0] = cacheBudget; u.misc4[1] = cacheCursor; u.misc4[2] = cacheEntries; u.misc4[3] = numTris;
                 const bool nrdEnabled = world.denoise > 0.0f;
-        u.params3[0] = 2.5f; u.params3[1] = 12.0f; u.params3[2] = world.denoise;
+        u.params3[0] = 2.5f; u.params3[1] = 12.0f; u.params3[2] = world.denoise; u.params3[3] = world.ssrBlur;
+        u.ssrParams[0] = world.ssrOpacity; u.ssrParams[1] = world.ssrEdgeFade; u.ssrParams[2] = world.ssrTemporal; u.ssrParams[3] = 0.0f;
         setV(u.skyZenith,  world.skyZenith  * world.skyIntensity);
         setV(u.skyHorizon, world.skyHorizon * world.skyIntensity);                                 
 #ifdef RTENGINE_HAS_DLSS
@@ -1499,6 +1552,18 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
     }
 };
         for (int i = 0; i < NP; ++i) {
+            if (i == 9) {   // half-res SSR: must finish before composite reads uSSRHalf
+                VkDescriptorSet ssrSet = nrdEnabled ? compositeSets[frame & 1] : sets[frame & 1];   // same set composite uses
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssrPipe);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, playout, 0, 1, &ssrSet, 0, nullptr);
+                vkCmdDispatch(cmd, (diW + 7) / 8, (diH + 7) / 8, 1);
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+                for (int dir = 0; dir < 3; ++dir) {   // horizontal blur, vertical blur, temporal resolve (descriptor set stays bound)
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ssrBlurPipe[dir]);
+                    vkCmdDispatch(cmd, (diW + 7) / 8, (diH + 7) / 8, 1);
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+                }
+            }
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipes[i]);
         VkDescriptorSet passSet = i == 9 && nrdEnabled ? compositeSets[frame & 1] : sets[frame & 1];
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, playout, 0, 1, &passSet, 0, nullptr);
@@ -1748,6 +1813,7 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
     }
 
     vkDeviceWaitIdle(g_dev);
+    world.audio.shutdown();
 #ifdef RTENGINE_HAS_DLSS
     if (streamlineInitialized && slShutdown() != sl::Result::eOk)
         std::fprintf(stderr, "Streamline shutdown reported an error\n");

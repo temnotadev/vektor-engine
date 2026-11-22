@@ -8,30 +8,46 @@ vec3 aces(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
-bool traceSSR(uvec2 px, vec3 p, vec3 n, vec3 direction, out ivec2 hitPixel) {
-    hitPixel = ivec2(-1);
-    vec3 origin = p + n * RAY_EPS;
-    for (int i = 0; i < 32; ++i) {
-        float t = 0.1 + 60.0 * float(i) / 31.0;
-        vec3 v = origin + direction * t - U.camPos.xyz;
-        float z = dot(v, U.camFwd.xyz);
-        if (z <= 1e-3) break;
-        vec2 ndc = vec2(dot(v, U.camRight.xyz) / (z * dot(U.camRight.xyz, U.camRight.xyz)),
-                        dot(v, U.camUp.xyz) / (z * dot(U.camUp.xyz, U.camUp.xyz)));
-        if (abs(ndc.x) >= 1.0 || abs(ndc.y) >= 1.0) break;
-        ivec2 sp = ivec2((ndc * vec2(0.5, -0.5) + 0.5) * vec2(U.misc0.xy));
-        if (all(equal(sp, ivec2(px)))) continue;
-        vec4 surface = imageLoad(gND, sp);
-        if (surface.w <= 0.0) continue;
-        float rayDist = length(v);
-        float gap = rayDist - surface.w;
-        float thickness = max(0.08, rayDist * 0.015);
-        if (gap >= 0.0 && gap < thickness && dot(surface.xyz, direction) < 0.0) {
-            hitPixel = sp;
-            return true;
+// ---- SSR resolve ------------------------------------------------------------------------------
+// Tunables for the reflection blend.
+#define SSR_F0_DIELECTRIC     0.04   // F0 of a non-metal at reflectivity 0 (the material's `reflectivity` lerps it to 1)
+#define SSR_ROUGH_FADE_START  0.45   // reflections start to fade out above this roughness ...
+#define SSR_UPSAMPLE_FOOTPRINT_PX 3.0 // bilateral slack of the upsample (full-res px)
+
+// Bilinear + bilateral upsample of the half-res SSR buffer (uSSRHistCur, premultiplied coverage).
+// Each of the 4 surrounding half-res texels gets  bilinearWeight * depth/normal similarity  to THIS
+// pixel's surface. (The previous version used depth weights only -> a plain box average of the 2x2
+// block, which is what produced the visible 2x2 blocks.) Returns premultiplied (rgb, coverage).
+vec4 ssrUpsample(ivec2 ip) {
+    ivec2 halfSize = ssrHalfSize();
+    // Texel h sits at full-res pixel 2h+1 (ssrRepPx), the pixel it was traced from.
+    vec2  hf = (vec2(ip) - 1.0) * 0.5;
+    ivec2 h0 = ivec2(floor(hf));
+    vec2  f  = hf - vec2(h0);
+
+    SsrSurf c = ssrSurfAt(ip);
+    vec4  acc  = vec4(0.0);
+    float wsum = 0.0;
+    for (int y = 0; y <= 1; ++y) {
+        for (int x = 0; x <= 1; ++x) {
+            ivec2 h  = clamp(h0 + ivec2(x, y), ivec2(0), halfSize - 1);
+            float bw = (x == 1 ? f.x : 1.0 - f.x) * (y == 1 ? f.y : 1.0 - f.y);
+            SsrSurf s = ssrSurfAt(ssrRepPx(h));
+            // 1e-3 floor: if no tap matches (thin geometry) we still resolve to the best-fitting
+            // neighbour mix instead of punching a hole.
+            float w = bw * (ssrBilateralWeight(c, s, SSR_UPSAMPLE_FOOTPRINT_PX) + 1e-3);
+            acc  += imageLoad(uSSRHistCur, h) * w;
+            wsum += w;
         }
     }
-    return false;
+    return acc / max(wsum, 1e-6);
+}
+
+// Schlick Fresnel with the roughness-aware grazing term (Lagarde): rough surfaces can't reach F = 1
+// at grazing angles, which is what makes their reflections fade instead of turning into mirrors.
+vec3 ssrFresnel(vec3 F0, float NdotV, float roughness) {
+    float k = pow(1.0 - clamp(NdotV, 0.0, 1.0), 5.0);
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * k;
 }
 
 vec3 blurSpecular(ivec2 centerPx) {
@@ -90,21 +106,31 @@ void main() {
         if (mode != 2u) color += direct;
         if (mode != 1u) color += alb.rgb * gi * (1.0 - metallic);
         if (mat.w > 0.5 && mat.y > 0.0) {
-            vec3 viewDir = primaryDir(px);
-            vec3 reflectedDir = reflect(viewDir, nd.xyz);
-            ivec2 hitPixel;
-            if (traceSSR(px, worldPos(px, nd.w), nd.xyz, reflectedDir, hitPixel)) {
-                vec4 hitAlbedo = imageLoad(gAlbedo, hitPixel);
-                vec4 hitMaterial = imageLoad(gMaterial, hitPixel);
-                vec3 reflected = hitAlbedo.a > 0.5 ? hitAlbedo.rgb
-                    : ((mode != 2u ? hitAlbedo.rgb * imageLoad(dirCur, hitPixel).rgb * (1.0 - hitMaterial.x) +
-                                      blurSpecular(hitPixel) : vec3(0.0)) +
-                       (mode != 1u ? hitAlbedo.rgb * imageLoad(giCur, hitPixel).rgb * (1.0 - hitMaterial.x) : vec3(0.0)));
-                float strength = clamp(max(mat.z, max(metallic, 0.04)) * mat.y, 0.0, 1.0);
-                vec3 f0 = mix(vec3(0.04), alb.rgb, metallic);
-                float fresnel = 1.0 - max(dot(-viewDir, nd.xyz), 0.0);
-                vec3 F = f0 + (1.0 - f0) * pow(fresnel, 5.0);
-                color += reflected * F * strength;
+            // Screen-space reflections: traced half-res by ssr_half.comp, filtered/accumulated by
+            // ssr_blur.comp, stored premultiplied in uSSRHistCur (rgb = colour * coverage, a = coverage =
+            // hit mask * screen-edge fade).
+            vec4 ssr = ssrUpsample(ip);
+            if (ssr.a > 1e-4) {
+                vec3  ssrColor  = ssr.rgb / ssr.a;
+                float roughness = 1.0 - clamp(mat.y, 0.0, 1.0);
+                float NdotV     = clamp(dot(normalize(nd.xyz), -primaryDir(px)), 0.0, 1.0);
+
+                // F0: dielectric base lerped towards 1 by the material's `reflectivity`, towards the
+                // albedo by `metallic`.
+                vec3 F0 = mix(vec3(mix(SSR_F0_DIELECTRIC, 1.0, clamp(mat.z, 0.0, 1.0))), alb.rgb, metallic);
+                vec3 F  = ssrFresnel(F0, NdotV, roughness);
+
+                // finalReflectionAlpha = ssrHitMask * fresnel * edgeFade * ssrOpacity
+                //   ssr.a = hitMask * edgeFade; fresnel = luminance of the roughness-aware Schlick term;
+                //   roughAtten additionally fades very rough surfaces out.
+                float fresnel    = luminance(F);
+                float roughAtten = 1.0 - smoothstep(SSR_ROUGH_FADE_START, 1.0, roughness);
+                float alpha = clamp(ssr.a * fresnel * roughAtten * clamp(U.ssrParams.x, 0.0, 1.0), 0.0, 1.0);
+
+                // Coloured Fresnel (metals) is kept as a hue tint on the reflection so the blend itself
+                // stays the plain scalar lerp: base -> reflection.
+                vec3 tint = F / max(fresnel, 1e-4);
+                color = mix(color, ssrColor * tint, alpha);
             }
         }
     } else {

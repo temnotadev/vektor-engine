@@ -1,0 +1,250 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Half-resolution screen-space reflection trace.
+//
+// One invocation = one reflection ray for a 2x2 block of full-res pixels (traced from pixel 2h+1,
+// see ssrRepPx in common.glsl). Output (uSSRRaw, then filtered by ssr_blur.comp):
+//   rgb = reflected HDR colour * coverage      a = coverage (hit mask * screen-edge fade)
+// Fresnel / roughness attenuation / ssrOpacity are NOT baked in here any more: composite.comp applies
+// them at full resolution (it needs per-pixel NdotV and F0, and baking them in cancelled out in the
+// old upsample, which divided rgb by the weighted alpha).
+//
+// Quality changes vs. the previous version:
+//   * Noise is now temporal: IGN + a golden-ratio sequence per frame, so the temporal resolve in
+//     ssr_blur.comp (pass 2) converges instead of staring at one fixed pattern.
+//   * Rays are jittered inside a roughness-driven cone (stochastic glossy reflections).
+//   * The hit blur is bilateral (depth + normal relative to the hit surface), so reflections no
+//     longer bleed across geometry edges.
+// With ssr_temporal 0 the frame term is dropped and the noise is static, like before.
+
+// ---- tunables --------------------------------------------------------------
+#define SSR_MAX_DIST      25.6   // world units (old: 256 steps * 0.1)
+#define SSR_STRIDE        2.0    // pixels per march step (min)
+#define SSR_MAX_STEPS     96     // hard cap; stride grows to fit long rays
+#define SSR_REFINE        5      // binary-search steps after a crossing
+#define SSR_NEAR          0.05   // near clip for the ray
+#define SSR_DEPTH_BIAS    0.01   // ray must be this far behind the surface to count
+#define SSR_THICK_ABS     0.5    // thickness: max(abs, rel * depth, step delta)
+#define SSR_THICK_REL     0.2
+#define SSR_BLUR_TAPS     24
+#define SSR_BLUR_MAX_PX   24.0   // footprint cap in px
+#define SSR_BLUR_FOOTPRINT_PX 4.0 // bilateral slack of the hit blur (see ssrBilateralWeight)
+#define SSR_CONE_SPREAD   0.0    // ray-direction jitter: tan(half-angle) at roughness 1 (scaled by roughness^2). 0 = off (default: the hit blur already does roughness; per-frame cone noise caused flicker)
+// ----------------------------------------------------------------------------
+
+// Project a view-space vector to [0,1] UV (matches primaryDir(); camRight/camUp
+// carry focal scale, so the divide normalizes by their squared lengths).
+vec2 ssrProjectUV(vec3 v) {
+    float z = dot(v, U.camFwd.xyz);
+    vec2 ndc = vec2(dot(v, U.camRight.xyz) / (z * dot(U.camRight.xyz, U.camRight.xyz)),
+                    dot(v, U.camUp.xyz)    / (z * dot(U.camUp.xyz,    U.camUp.xyz)));
+    return vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+}
+
+// Smooth screen-border mask: 1 in the interior, 0 at UV = 0 / 1, soft ramp of `width` (in UV units).
+// Product of the two axes (instead of min) so corners fade smoothly too.
+float edgeFade(vec2 uv) {
+    float w = max(U.ssrParams.y, 1e-4);
+    vec2 d = smoothstep(vec2(0.0), vec2(w), min(uv, 1.0 - uv));
+    return d.x * d.y;
+}
+
+// view-space depth (distance along camFwd) at a full-res pixel, or -1 on sky.
+float viewSpaceDepth(ivec2 sp) {
+    vec4 s = imageLoad(gND, sp);
+    if (s.w <= 0.0) return -1.0;
+    vec2 sndc = (vec2(sp) + 0.5) / vec2(U.misc0.xy) * 2.0 - 1.0;
+    sndc.y = -sndc.y;
+    vec3 v = U.camFwd.xyz + sndc.x * U.camRight.xyz + sndc.y * U.camUp.xyz;
+    // dot(normalize(v), fwd) * t
+    return dot(v, U.camFwd.xyz) * inversesqrt(dot(v, v)) * s.w;
+}
+
+// Perspective-correct screen-space march.
+// Screen position is linear in s, and 1/z is linear in s, so the ray depth at any
+// sample is 1 / mix(k0, k1, s).
+bool traceSSR(vec3 p, vec3 n, vec3 dir, float jit, out ivec2 hitPixel, out float fade) {
+    hitPixel = ivec2(-1);
+    fade = 0.0;
+
+    vec3  camPos = U.camPos.xyz;
+    vec3  fwd    = U.camFwd.xyz;
+    vec2  res    = vec2(U.misc0.xy);
+    ivec2 maxPx  = ivec2(U.misc0.xy) - 1;
+
+    vec3  o  = p + n * RAY_EPS;
+    float z0 = dot(o - camPos, fwd);
+    float dz = dot(dir, fwd);
+    if (z0 <= SSR_NEAR) return false;
+
+    // Clip the ray to max distance and to the near plane.
+    float tMax = SSR_MAX_DIST;
+    if (dz < 0.0) tMax = min(tMax, (z0 - SSR_NEAR) / (-dz));
+    vec3  e  = o + dir * tMax;
+    float z1 = max(dot(e - camPos, fwd), SSR_NEAR);
+
+    vec2 p0 = ssrProjectUV(o - camPos) * res;
+    vec2 p1 = ssrProjectUV(e - camPos) * res;
+    vec2 d  = p1 - p0;
+
+    // Clip the screen segment to the screen rectangle (p0 is on screen).
+    float sMax = 1.0;
+    if (d.x > 0.0)      sMax = min(sMax, (res.x - 1.0 - p0.x) / d.x);
+    else if (d.x < 0.0) sMax = min(sMax, (0.0 - p0.x) / d.x);
+    if (d.y > 0.0)      sMax = min(sMax, (res.y - 1.0 - p0.y) / d.y);
+    else if (d.y < 0.0) sMax = min(sMax, (0.0 - p0.y) / d.y);
+    sMax = max(sMax, 0.0);
+
+    float major = max(abs(d.x), abs(d.y));
+    if (major * sMax < SSR_STRIDE) return false;   // ray is (almost) a point on screen
+
+    // Stride grows for long rays so the step count stays bounded.
+    float stride = max(SSR_STRIDE, major * sMax / float(SSR_MAX_STEPS));
+    float ds     = stride / major;                 // screen-param per step
+
+    float k0 = 1.0 / z0, k1 = 1.0 / z1;
+    float dk = k1 - k0;
+
+    float sPrev = 0.0;
+    float sCur  = ds * (1.0 + jit);                // >= 1 stride away: no self-hit
+
+    for (int i = 0; i < SSR_MAX_STEPS; ++i) {
+        float sc = min(sCur, sMax);
+        vec2  pc = p0 + d * sc;
+        ivec2 ip = clamp(ivec2(pc), ivec2(0), maxPx);
+
+        float surfZ = viewSpaceDepth(ip);
+        if (surfZ > 0.0) {
+            float rayZ = 1.0 / (k0 + dk * sc);
+            float gap  = rayZ - surfZ;
+            if (gap > SSR_DEPTH_BIAS) {
+                // Ray depth change over one step; a steep ray can legitimately
+                // cross a surface by more than the fixed thickness.
+                float zPrev = 1.0 / (k0 + dk * sPrev);
+                float thick = max(max(SSR_THICK_ABS, SSR_THICK_REL * rayZ),
+                                  1.5 * abs(rayZ - zPrev));
+                if (gap < thick) {
+                    // Crossed between sPrev and sc: binary-search the hit.
+                    float a = sPrev, b = sc;
+                    ivec2 best = ip;
+                    for (int r = 0; r < SSR_REFINE; ++r) {
+                        float m  = 0.5 * (a + b);
+                        ivec2 mp = clamp(ivec2(p0 + d * m), ivec2(0), maxPx);
+                        float sz = viewSpaceDepth(mp);
+                        float rz = 1.0 / (k0 + dk * m);
+                        if (sz > 0.0 && rz - sz > 0.0) { b = m; best = mp; }
+                        else                           { a = m; }
+                    }
+                    hitPixel = best;
+                    fade = edgeFade((vec2(best) + 0.5) / res);
+                    return true;
+                }
+            }
+        }
+        if (sc >= sMax) break;
+        sPrev = sc;
+        sCur  = sc + ds;
+    }
+    return false;
+}
+
+// Lit source color at a full-res pixel (direct + GI), matching composite's ssrLit.
+vec3 ssrLit(ivec2 sp, uint mode) {
+    vec4 a = imageLoad(gAlbedo, sp);
+    if (a.a > 0.5) return a.rgb;
+    vec4 m = imageLoad(gMaterial, sp);
+    vec3 col = vec3(0.0);
+    if (mode != 2u) col += a.rgb * imageLoad(dirCur, sp).rgb * (1.0 - m.x);
+    if (mode != 1u) col += a.rgb * imageLoad(giCur, sp).rgb * (1.0 - m.x);
+    return col;
+}
+
+// Roughness-driven blur of the lit source around the hit: Vogel spiral, Gaussian x bilateral.
+// The bilateral term (plane-distance + normal vs. the HIT surface) stops the footprint from
+// averaging in colours of unrelated geometry behind / in front of the hit. The centre tap is always
+// included (weight 1), so thin hits can never end up with an empty footprint.
+vec3 ssrBlur(ivec2 centerPx, vec4 mat, uint mode, float rot) {
+    float roughness = max(1.0 - mat.y, 0.045);
+    float radius = clamp((1.0 + roughness * U.params3.w) * 6.0, 4.0, 48.0);
+    float sigma  = radius * 0.5;
+    float inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    float diskR  = min(radius, SSR_BLUR_MAX_PX);
+    ivec2 maxPx  = ivec2(U.misc0.xy) - 1;
+
+    SsrSurf c = ssrSurfAt(centerPx);
+    vec3  acc  = ssrLit(centerPx, mode);
+    float wsum = 1.0;
+    for (int i = 0; i < SSR_BLUR_TAPS; ++i) {
+        float r   = diskR * sqrt((float(i) + 0.5) / float(SSR_BLUR_TAPS));
+        float ang = float(i) * 2.39996323 + rot;
+        ivec2 sp  = clamp(centerPx + ivec2(round(vec2(cos(ang), sin(ang)) * r)), ivec2(0), maxPx);
+        SsrSurf s = ssrSurfAt(sp);
+        float g = exp(-(r * r) * inv2s2) * ssrBilateralWeight(c, s, SSR_BLUR_FOOTPRINT_PX + 0.5 * r);
+        if (g <= 1e-4) continue;
+        acc  += ssrLit(sp, mode) * g;
+        wsum += g;
+    }
+    return acc / wsum;
+}
+
+// Stochastic glossy direction: jitter R inside a cone whose width follows roughness^2.
+vec3 ssrJitterDir(vec3 R, vec3 n, float roughness, vec2 u) {
+    float spread = roughness * roughness * SSR_CONE_SPREAD;
+    if (spread < 1e-3) return R;
+    float r   = sqrt(u.x) * spread;
+    float phi = 6.28318530718 * u.y;
+    vec3 t = normalize(abs(R.y) > 0.99 ? cross(R, vec3(1.0, 0.0, 0.0)) : cross(R, vec3(0.0, 1.0, 0.0)));
+    vec3 b = cross(R, t);
+    vec3 d = normalize(R + (t * cos(phi) + b * sin(phi)) * r);
+    float nd = dot(d, n);
+    if (nd < 0.02) d = normalize(d + n * (0.02 - nd));   // never dive under the surface
+    return d;
+}
+
+void main() {
+    uvec2 hpx = gl_GlobalInvocationID.xy;                       // half-res texel
+    ivec2 halfSize = ivec2((U.misc0.xy + 1u) / 2u);
+    if (any(greaterThanEqual(hpx, uvec2(halfSize)))) return;
+
+    imageStore(uSSRRaw, ivec2(hpx), vec4(0.0));
+
+    // Representative full-res pixel of the 2x2 block (same one the filters anchor to).
+    ivec2 fp = ssrRepPx(ivec2(hpx));
+
+    vec4 nd  = imageLoad(gND, fp);
+    vec4 alb = imageLoad(gAlbedo, fp);
+    vec4 mat = imageLoad(gMaterial, fp);
+    if (nd.w <= 0.0) return;                    // sky
+    if (alb.a > 0.5) return;                    // emissive
+    if (!(mat.w > 0.5 && mat.y > 0.0)) return;  // ssr off / fully rough
+
+    vec3 viewDir = primaryDir(uvec2(fp));
+    vec3 surfacePos = worldPos(uvec2(fp), nd.w);
+    vec3 reflectedDir = reflect(viewDir, nd.xyz);
+
+    // Per-frame noise. Frame term only while temporal accumulation is on (ssr_temporal > 0);
+    // otherwise keep the old static pattern, which is the stable choice without accumulation.
+    float fi = U.ssrParams.z > 0.0 ? float(U.misc0.z & 1023u) : 0.0;
+    float i0 = ssrIGN(vec2(hpx));
+    float i1 = ssrIGN(vec2(hpx) + vec2(17.0, 43.0));
+    float i2 = ssrIGN(vec2(hpx) + vec2(61.0, 29.0));
+    float n0 = i0;                                                              // march start offset: STATIC per pixel so hit/miss coverage can't flip frame to frame
+    float n1 = fract(i1 + fi * 0.75487766625);                                  // hit-blur rotation
+    vec2  u  = fract(vec2(i1, i2) + fi * vec2(0.75487766625, 0.56984029100));   // cone sample (R2)
+
+    float roughness = max(1.0 - mat.y, 0.045);
+    vec3 rayDir = ssrJitterDir(reflectedDir, nd.xyz, roughness, u);
+
+    ivec2 hitPixel;
+    float fade;
+    if (traceSSR(surfacePos, nd.xyz, rayDir, n0, hitPixel, fade)) {
+        uint mode = U.misc1.y;
+        vec3 reflected = ssrBlur(hitPixel, mat, mode, n1 * 6.2831853);
+
+        // Premultiplied coverage: rgb = colour * coverage, a = coverage (hit mask * edge fade).
+        imageStore(uSSRRaw, ivec2(hpx), vec4(reflected * fade, fade));
+    }
+}

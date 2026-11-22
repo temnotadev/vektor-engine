@@ -1,0 +1,138 @@
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Half-res SSR filtering. One shader, three passes selected by specialization constant 0:
+//   0 = horizontal bilateral Gaussian   uSSRRaw  -> uSSRTmp
+//   1 = vertical   bilateral Gaussian   uSSRTmp  -> uSSRHalf
+//   2 = temporal resolve                uSSRHalf + uSSRHistPrev -> uSSRHistCur   (composite.comp reads this)
+//
+// All buffers hold PREMULTIPLIED coverage (rgb = colour * coverage, a = coverage), so the filters are plain
+// weighted sums: a miss (0,0,0,0) lowers coverage (soft reflection edges) without darkening neighbouring hits.
+//
+// Blur strength comes from the script's `ssr_blur <0..64>`:
+//   sigma (half-res texels) = max(ssr_blur * 0.25, SSR_MIN_SIGMA), capped at SSR_BLUR_RADIUS / 2.
+// SSR_MIN_SIGMA keeps a small denoise on even at ssr_blur 0, which the stochastic trace needs
+// (previously the pass degenerated to a copy there, leaving the half-res blocks untouched).
+//
+// Taps are weighted by linear depth + surface normal (ssrBilateralWeight), so reflections neither bleed
+// across silhouettes nor across creases.
+layout(constant_id = 0) const uint SSR_PASS = 0u;
+
+#define SSR_BLUR_RADIUS        12     // max taps each side
+#define SSR_MIN_SIGMA          0.75   // half-res texels
+#define SSR_BLUR_FOOTPRINT_PX  2.0    // bilateral slack per tap offset, in full-res px (see ssrBilateralWeight)
+#define SSR_TEMPORAL_CLIP      2.0    // history is clipped to mean +- this many sigmas of the current 3x3
+#define SSR_TEMPORAL_MOTION_PX 8.0    // reprojection shift (full-res px) at which history weight drops by half
+
+vec4 loadSrc(ivec2 q) {
+    if (SSR_PASS == 1u) return imageLoad(uSSRTmp, q);
+    return imageLoad(uSSRRaw, q);
+}
+void storeDst(ivec2 q, vec4 v) {
+    if (SSR_PASS == 1u) imageStore(uSSRHalf, q, v);
+    else                imageStore(uSSRTmp, q, v);
+}
+
+void blurPass(ivec2 hp, ivec2 halfSize) {
+    vec4 center = loadSrc(hp);
+
+    SsrSurf c = ssrSurfAt(ssrRepPx(hp));
+    if (c.t <= 0.0) { storeDst(hp, center); return; }     // sky: nothing to filter
+
+    float sigma = clamp(max(U.params3.w * 0.25, SSR_MIN_SIGMA), SSR_MIN_SIGMA, float(SSR_BLUR_RADIUS) * 0.5);
+    int   R     = min(SSR_BLUR_RADIUS, int(ceil(2.5 * sigma)));
+    float inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    ivec2 dir = SSR_PASS == 1u ? ivec2(0, 1) : ivec2(1, 0);
+
+    vec4  acc  = center;        // centre tap, weight 1 (always valid -> never an empty footprint)
+    float wsum = 1.0;
+    for (int i = -R; i <= R; ++i) {
+        if (i == 0) continue;
+        ivec2 q = hp + dir * i;
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, halfSize))) continue;
+        SsrSurf s = ssrSurfAt(ssrRepPx(q));
+        // one half-res step = 2 full-res px, so the plane-distance slack grows with the tap offset
+        float w = exp(-float(i * i) * inv2s2) *
+                  ssrBilateralWeight(c, s, SSR_BLUR_FOOTPRINT_PX * (1.0 + float(abs(i))));
+        if (w <= 1e-4) continue;
+        acc  += loadSrc(q) * w;
+        wsum += w;
+    }
+    storeDst(hp, acc / wsum);
+}
+
+// Temporal accumulation: reproject this texel's surface into last frame, bilinearly fetch the 4 history
+// texels (each validated against the previous G-buffer: same plane, similar normal), clip the history to the
+// current neighbourhood (kills ghosts when the reflected content moves), then exponential blend.
+void temporalPass(ivec2 hp, ivec2 halfSize) {
+    vec4  cur   = imageLoad(uSSRHalf, hp);
+    float histW = clamp(U.ssrParams.z, 0.0, 0.98);
+
+    ivec2   fp = ssrRepPx(hp);
+    SsrSurf s  = ssrSurfAt(fp);
+    if (s.t <= 0.0 || histW <= 0.0 || U.misc0.z == 0u) { imageStore(uSSRHistCur, hp, cur); return; }
+
+    // Camera reprojection of the surface point (same maths as common.glsl reproject(), but continuous).
+    vec3  v = s.p - U.prevPos.xyz;
+    float z = dot(v, U.prevFwd.xyz);
+    if (z <= 1e-4) { imageStore(uSSRHistCur, hp, cur); return; }
+    vec2 ndc = vec2(dot(v, U.prevRight.xyz) / (z * dot(U.prevRight.xyz, U.prevRight.xyz)),
+                    dot(v, U.prevUp.xyz)    / (z * dot(U.prevUp.xyz,    U.prevUp.xyz)));
+    vec2 uv     = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    vec2 prevPx = uv * vec2(U.misc0.xy) - 0.5 - U.jitter.zw;   // continuous full-res pixel index in the previous frame
+
+    // Half-res texel h sits at full-res pixel 2h+1 (ssrRepPx), so continuous half coord = (px - 1) / 2.
+    vec2  hf = (prevPx - 1.0) * 0.5;
+    ivec2 h0 = ivec2(floor(hf));
+    vec2  f  = hf - vec2(h0);
+
+    float tol = max(0.03, 8.0 * s.t * U.params2.w);
+    vec4  hist = vec4(0.0);
+    float hw   = 0.0;
+    for (int y = 0; y <= 1; ++y) {
+        for (int x = 0; x <= 1; ++x) {
+            ivec2 h = h0 + ivec2(x, y);
+            if (any(lessThan(h, ivec2(0))) || any(greaterThanEqual(h, halfSize))) continue;
+            float bw = (x == 1 ? f.x : 1.0 - f.x) * (y == 1 ? f.y : 1.0 - f.y);
+            ivec2 pf  = ssrRepPx(h);
+            vec4  pnd = imageLoad(gNDPrev, pf);
+            if (pnd.w <= 0.0) continue;                                        // was sky
+            vec3 pPrev = previousWorldPos(pf, pnd.w);
+            if (abs(dot(s.p - pPrev, s.n)) > tol || dot(pnd.xyz, s.n) < 0.5) continue;   // disocclusion / other surface
+            hist += imageLoad(uSSRHistPrev, h) * bw;
+            hw   += bw;
+        }
+    }
+    if (hw < 0.05) { imageStore(uSSRHistCur, hp, cur); return; }               // nothing trustworthy: restart from current
+    hist /= hw;
+
+    // Neighbourhood variance clip on the current (already bilaterally filtered) buffer.
+    vec4 m1 = vec4(0.0), m2 = vec4(0.0);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec4 c = imageLoad(uSSRHalf, clamp(hp + ivec2(dx, dy), ivec2(0), halfSize - 1));
+            m1 += c; m2 += c * c;
+        }
+    }
+    vec4 mu = m1 * (1.0 / 9.0);
+    vec4 sd = sqrt(max(m2 * (1.0 / 9.0) - mu * mu, 0.0));
+    vec4 lo = min(mu - SSR_TEMPORAL_CLIP * sd, cur);
+    vec4 hi = max(mu + SSR_TEMPORAL_CLIP * sd, cur);
+    hist = clamp(hist, lo, hi);
+
+    // Trust history less while the view is moving (reflections slide relative to the surface).
+    float motion = length(prevPx - vec2(fp));
+    float w = histW * (1.0 - 0.3 * clamp(motion / SSR_TEMPORAL_MOTION_PX, 0.0, 1.0));
+    imageStore(uSSRHistCur, hp, mix(cur, hist, w));
+}
+
+void main() {
+    ivec2 hp = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 halfSize = ssrHalfSize();
+    if (any(greaterThanEqual(hp, halfSize))) return;
+
+    if (SSR_PASS == 2u) temporalPass(hp, halfSize);
+    else                blurPass(hp, halfSize);
+}

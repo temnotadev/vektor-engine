@@ -26,6 +26,7 @@ layout(set = 0, binding = 1, std140) uniform FrameUBO {
     vec4  skyZenith;   
     vec4  skyHorizon;  
         vec4  jitter;      
+    vec4  ssrParams;   // x = ssrOpacity (0..1), y = screen-edge fade width (UV), z = temporal history weight (0 = off), w = reserved
 } U;
 
 struct Tri {
@@ -93,6 +94,22 @@ struct BVHNode { vec3 bmin; float power; vec3 bmax; uint leftOrLight; uint right
 layout(set = 0, binding = 25, std430) readonly buffer BVHBuf { BVHNode bvhNodes[]; };
 layout(set = 0, binding = 35, rgba16f) uniform image2D gMaterial;
 layout(set = 0, binding = 36, rgba16f) uniform image2D directSpec;
+
+// Half-resolution screen-space reflection target (single-level storage image),
+// written by ssr_half.comp and bilateral-upsampled in composite.comp.
+layout(set = 0, binding = 45, rgba16f) uniform image2D uSSRHalf;
+// SSR blur chain: ssr_half.comp traces into uSSRRaw, ssr_blur.comp blurs
+// uSSRRaw -> uSSRTmp (horizontal) -> uSSRHalf (vertical).
+// All SSR buffers share one contract: PREMULTIPLIED coverage.
+//   rgb = reflected HDR colour * coverage, a = coverage (= hit mask * screen-edge fade, 0..1).
+// Premultiplied data blurs/accumulates linearly (misses don't darken hits); composite resolves rgb / a
+// and applies Fresnel / roughness / ssrOpacity at full resolution.
+layout(set = 0, binding = 46, rgba16f) uniform image2D uSSRRaw;
+layout(set = 0, binding = 47, rgba16f) uniform image2D uSSRTmp;
+// SSR temporal history (ping-ponged with the frame parity exactly like gND / gNDPrev).
+// ssr_blur.comp (pass 2) resolves uSSRHalf + uSSRHistPrev -> uSSRHistCur; composite.comp reads uSSRHistCur.
+layout(set = 0, binding = 48, rgba16f) uniform image2D uSSRHistCur;
+layout(set = 0, binding = 49, rgba16f) uniform image2D uSSRHistPrev;
 
 
 uint pcgHash(uint v) {
@@ -464,3 +481,47 @@ float balanceHeuristic(float a, float b) {
 
 
 bool badf(float x) { return isnan(x) || isinf(x); }
+
+
+// ---------------------------------------------------------------------------
+// SSR shared helpers. Everything is prefixed ssr* so it can't collide with other passes.
+// ---------------------------------------------------------------------------
+
+// Weight exponent for the normal term of the bilateral filters (higher = stricter).
+#define SSR_BILATERAL_NORMAL_POW 2.0   // low on purpose: gND holds normal-MAPPED normals, a strict term makes bumpy floors unfilterable (noisy)
+
+// Interleaved gradient noise (Jimenez). Pass pixel + per-frame offset for temporal variation.
+float ssrIGN(vec2 p) { return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+
+ivec2 ssrHalfSize() { return ivec2((U.misc0.xy + 1u) / 2u); }
+
+// Full-res pixel that represents half-res texel hp (the pixel ssr_half.comp traces from).
+// Half-res texel h therefore "lives" at full-res pixel coordinate 2h+1; every upsample / history
+// lookup below is anchored to that so the traced position and the filter position agree.
+ivec2 ssrRepPx(ivec2 hp) { return min(hp * 2 + 1, ivec2(U.misc0.xy) - 1); }
+
+struct SsrSurf { vec3 p; vec3 n; float t; };   // world pos, normal, ray distance (t <= 0: sky)
+
+SsrSurf ssrSurfAt(ivec2 fp) {
+    SsrSurf s;
+    vec4 nd = imageLoad(gND, fp);
+    s.t = nd.w;
+    s.n = nd.xyz;
+    s.p = nd.w > 0.0 ? worldPos(uvec2(fp), nd.w) : vec3(0.0);
+    return s;
+}
+
+// Edge-stopping weight between a centre surface c and a tap s: linear depth + normal.
+// Depth is compared as distance from each surface's tangent plane (symmetric), i.e. the linear
+// depth difference corrected for slope, so a floor seen at a grazing angle isn't treated as a
+// depth edge, while a real silhouette (large plane distance) or crease (normals differ) is.
+// footprintPx = how many full-res pixels of slack the plane distance gets at c's distance.
+float ssrBilateralWeight(SsrSurf c, SsrSurf s, float footprintPx) {
+    if (s.t <= 0.0) return 0.0;
+    vec3  d    = s.p - c.p;
+    float pd   = 0.5 * (abs(dot(d, c.n)) + abs(dot(d, s.n)));
+    float tol  = max(0.01, c.t * U.params2.w * footprintPx);
+    float wz   = exp(-pd / tol);
+    float wn   = pow(max(dot(c.n, s.n), 0.0), SSR_BILATERAL_NORMAL_POW);
+    return wz * wn;
+}

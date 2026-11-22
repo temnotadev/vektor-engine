@@ -25,6 +25,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #include "physics.hpp"
+#include "audio.hpp"
 
 
 constexpr float kPi = 3.14159265359f;
@@ -117,6 +118,22 @@ struct LightDef {
     float intensity = 1.0f;                                            
     float radius = 0.03f, range = 5.0f, inner = 20.0f, outer = 35.0f;   
     bool strictAttenuation = false;
+};
+
+// A named sound source. `pos`/`range` are used by the editor (and are kept so
+// scripts can move sound objects), while playback itself is handled by
+// AudioSystem. A sound may be used purely as an asset (play sfx_click) or as a
+// placed object in the scene (sound ambience ... pos 0 2 0).
+struct SoundDef {
+    std::string name;
+    std::string path;
+    V3 pos{0, 0, 0};
+    float volume = 1.0f;
+    float pan = 0.0f;
+    float range = 10.0f;
+    bool loop = false;
+    bool autoplay = false;
+    bool spatial = false;
 };
 struct TexUpload { uint32_t layer; std::vector<uint8_t> data; };   
 
@@ -394,6 +411,7 @@ struct World {
     std::map<std::string, int> meshIndex, modelByKey;
     std::vector<Object> objects;
     std::vector<LightDef> lights;
+    std::vector<SoundDef> sounds;
     std::vector<CustomShader> shaders;
     std::map<std::string, Material> materials;
     std::map<std::string, int> texIds, texByPath;     
@@ -410,6 +428,10 @@ struct World {
     uint32_t giOffscreenRate = 8;                     
     float cacheCellSize = 0.7f;                       
     float denoise = 1.0f;                             
+    float ssrBlur = 2.0f;                            
+    float ssrOpacity = 1.0f;                         // overall SSR transparency 0..1
+    float ssrEdgeFade = 0.10f;                       // screen-border fade width (UV units)
+    float ssrTemporal = 0.90f;                       // SSR history weight, 0 = off
     int dlssMode = 0;                                 
     V3 skyZenith{0.10f, 0.18f, 0.35f};                
     V3 skyHorizon{0.55f, 0.62f, 0.72f};               
@@ -430,15 +452,19 @@ struct World {
     V3 camPos{0, 2.5f, 8.5f}; float camYaw = 0, camPitch = 0;   
     bool camChanged = false;
     PhysicsWorld physics;
+    AudioSystem audio;
 
     World() {
         for (Mesh m : {makeCube(), makeQuad(), makeSphere()}) { meshIndex[m.name] = (int)meshes.size(); meshes.push_back(m); }
     }
     void clearScene() {                               
         objects.clear(); lights.clear(); shaders.clear(); materials.clear(); vars.clear(); texIds.clear(); spawnCounter = 0; dirty = true;
+        audio.stopAll();
+        audio.unloadAll();
+        sounds.clear();
         physics.clear();
         areaLights = true; giMode = 1; giRate = 1; giOffscreenRate = 8; cacheCellSize = 0.3f;
-        denoise = 1.0f; dlssMode = 0; camCollide = false; camLocked = false; camRadius = 0.3f;
+        denoise = 1.0f; ssrBlur = 2.0f; ssrOpacity = 1.0f; ssrEdgeFade = 0.10f; ssrTemporal = 0.90f; dlssMode = 0; camCollide = false; camLocked = false; camRadius = 0.3f;
         playerController = false; playerGravity = true; playerGrounded = false; playerVelocityY = 0.0f;
         playerRadius = 0.3f; playerHeight = 1.8f; playerEyeHeight = 1.62f;
         playerSpeed = 4.5f; playerJumpSpeed = 5.2f;
@@ -932,9 +958,23 @@ private:
     }
     static std::vector<std::string> tokenize(const std::string& s) {
         std::vector<std::string> t;
-        std::istringstream ss(s);
-        std::string x;
-        while (ss >> x) t.push_back(x);
+        size_t i = 0;
+        while (i < s.size()) {
+            while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
+            if (i >= s.size()) break;
+            std::string x;
+            if (s[i] == '"') {
+                ++i;
+                while (i < s.size()) {
+                    if (s[i] == '\\' && i + 1 < s.size() && s[i + 1] == '"') { x.push_back('"'); i += 2; }
+                    else if (s[i] == '"') { ++i; break; }
+                    else x.push_back(s[i++]);
+                }
+            } else {
+                while (i < s.size() && !std::isspace((unsigned char)s[i])) x.push_back(s[i++]);
+            }
+            t.push_back(std::move(x));
+        }
         return t;
     }
     void err(int line, const std::string& m) const {
@@ -963,6 +1003,7 @@ private:
         w.vars["$camx"] = w.camPos.x; w.vars["$camy"] = w.camPos.y; w.vars["$camz"] = w.camPos.z;
         w.vars["$camyaw"] = w.camYaw; w.vars["$campitch"] = w.camPitch;
         w.vars["$objects"] = float(w.objects.size()); w.vars["$lights"] = float(w.lights.size());
+        w.vars["$sounds"] = float(w.sounds.size());
     }
 
     void run(const Event& e) {
@@ -992,6 +1033,7 @@ private:
 
     Object* findObj(const std::string& n) { for (auto& o : w.objects) if (o.name == n) return &o; return nullptr; }
     LightDef* findLight(const std::string& n) { for (auto& l : w.lights) if (l.name == n) return &l; return nullptr; }
+    SoundDef* findSound(const std::string& n) { for (auto& s : w.sounds) if (s.name == n) return &s; return nullptr; }
 
     bool materialOption(Material& m, const std::vector<std::string>& t, size_t& i, int ln) {
         const std::string& key = t[i];
@@ -1030,9 +1072,15 @@ private:
         auto match = [&](const std::string& n) { return prefix ? n.compare(0, base.size(), base) == 0 : n == base; };
         auto a = std::remove_if(w.objects.begin(), w.objects.end(), [&](const Object& o) { return match(o.name); });
         auto b = std::remove_if(w.lights.begin(), w.lights.end(), [&](const LightDef& l) { return match(l.name); });
-        if (a != w.objects.end() || b != w.lights.end()) w.dirty = true;
+        auto c = std::remove_if(w.sounds.begin(), w.sounds.end(), [&](const SoundDef& s) {
+            if (!match(s.name)) return false;
+            w.audio.unload(s.name);
+            return true;
+        });
+        if (a != w.objects.end() || b != w.lights.end() || c != w.sounds.end()) w.dirty = true;
         w.objects.erase(a, w.objects.end());
         w.lights.erase(b, w.lights.end());
+        w.sounds.erase(c, w.sounds.end());
     }
 
     void command(const std::vector<std::string>& t, int ln) {
@@ -1227,12 +1275,35 @@ private:
                 }
                 else err(ln, "bad property '" + p + "' for a light");
                 w.dirty = true;
-            } else err(ln, "no object or light named '" + t[1] + "'");
+            } else if (SoundDef* s = findSound(t[1])) {
+                if (p == "pos" && t.size() >= 6) s->pos = vec3(t, 3, ln);
+                else if (p == "volume") {
+                    s->volume = std::clamp(num(t[3], ln), 0.0f, 1.0f);
+                    w.audio.setVolume(s->name, s->volume);
+                } else if (p == "pan") {
+                    s->pan = std::clamp(num(t[3], ln), -1.0f, 1.0f);
+                    w.audio.setPan(s->name, s->pan);
+                } else if (p == "range") s->range = std::max(0.01f, num(t[3], ln));
+                else if (p == "loop") {
+                    if (t[3] != "on" && t[3] != "off") { err(ln, "sound loop must be on or off"); return; }
+                    s->loop = isOn(t[3]);
+                    w.audio.setLooping(s->name, s->loop);
+                } else if (p == "autoplay") s->autoplay = isOn(t[3]);
+                else if (p == "playing") {
+                    if (isOn(t[3])) {
+                        if (!w.audio.exists(s->name)) w.audio.load(s->name, s->path);
+                        w.audio.play(s->name, s->loop, s->volume, s->pan);
+                    } else {
+                        w.audio.pause(s->name);
+                    }
+                } else err(ln, "bad property '" + p + "' for a sound");
+            } else err(ln, "no object, light or sound named '" + t[1] + "'");
         } else if (c == "move" || c == "rotate") {
             if (!need(t, 5, ln, "move|rotate <name> dx dy dz")) return;
             V3 d = vec3(t, 2, ln);
             if (Object* o = findObj(t[1])) { if (c == "move") o->pos = o->pos + d; else o->rot = o->rot + d; w.dirty = true; }
             else if (LightDef* l = findLight(t[1])) { if (c == "move") l->pos = l->pos + d; else err(ln, "cannot rotate a light, use: set <name> dir x y z"); w.dirty = true; }
+            else if (SoundDef* s = findSound(t[1])) { if (c == "move") s->pos = s->pos + d; else err(ln, "cannot rotate a sound"); }
             else err(ln, "no object or light named '" + t[1] + "'");
         } else if (c == "light") {
             if (!need(t, 3, ln, "light point|spot|sun <name> ...")) return;
@@ -1273,6 +1344,62 @@ private:
             destroy(l.name);
             w.lights.push_back(l);
             w.dirty = true;
+        } else if (c == "sound") {
+            if (!need(t, 3, ln, "sound <name> <file> [pos x y z] [volume v] [pan p] [range r] [loop on|off] [autoplay] [spatial]")) return;
+            SoundDef s;
+            s.name = t[1];
+            s.path = w.resolve(t[2]);
+            auto flag = [&](bool& out, size_t& i) {
+                if (i + 1 < t.size() && (t[i + 1] == "on" || t[i + 1] == "off")) {
+                    out = t[i + 1] == "on";
+                    i += 2;
+                } else {
+                    out = true;
+                    ++i;
+                }
+            };
+            for (size_t i = 3; i < t.size();) {
+                const std::string& k = t[i];
+                if (k == "pos" && i + 3 < t.size()) { s.pos = vec3(t, i + 1, ln); i += 4; }
+                else if (k == "volume" && i + 1 < t.size()) { s.volume = std::clamp(num(t[i + 1], ln), 0.0f, 1.0f); i += 2; }
+                else if (k == "pan" && i + 1 < t.size()) { s.pan = std::clamp(num(t[i + 1], ln), -1.0f, 1.0f); i += 2; }
+                else if (k == "range" && i + 1 < t.size()) { s.range = std::max(0.01f, num(t[i + 1], ln)); i += 2; }
+                else if (k == "loop") flag(s.loop, i);
+                else if (k == "autoplay") flag(s.autoplay, i);
+                else if (k == "spatial") flag(s.spatial, i);
+                else { err(ln, "bad sound option '" + k + "'"); ++i; }
+            }
+            destroy(s.name);
+            if (!w.audio.load(s.name, s.path)) { err(ln, "cannot load sound '" + t[2] + "'"); return; }
+            w.sounds.push_back(s);
+            if (s.autoplay) w.audio.play(s.name, s.loop, s.volume, s.pan);
+        } else if (c == "play" || c == "pause" || c == "resume" || c == "stop") {
+            if (!need(t, 2, ln, "play|pause|resume|stop <sound> [loop|once] [volume v] [pan p]")) return;
+            SoundDef* s = findSound(t[1]);
+            if (!s) { err(ln, "no sound named '" + t[1] + "'"); return; }
+            if (!w.audio.exists(s->name)) w.audio.load(s->name, s->path);
+            if (c == "play") {
+                bool loop = s->loop;
+                float volume = s->volume, pan = s->pan;
+                for (size_t i = 2; i < t.size();) {
+                    if (t[i] == "loop") { loop = true; ++i; }
+                    else if (t[i] == "once") { loop = false; ++i; }
+                    else if (t[i] == "volume" && i + 1 < t.size()) { volume = std::clamp(num(t[i + 1], ln), 0.0f, 1.0f); i += 2; }
+                    else if (t[i] == "pan" && i + 1 < t.size()) { pan = std::clamp(num(t[i + 1], ln), -1.0f, 1.0f); i += 2; }
+                    else { err(ln, "bad play option '" + t[i] + "'"); ++i; }
+                }
+                s->loop = loop; s->volume = volume; s->pan = pan;
+                if (!w.audio.play(s->name, loop, volume, pan)) err(ln, "cannot play sound '" + s->name + "'");
+            } else if (c == "pause") w.audio.pause(s->name);
+            else if (c == "resume") w.audio.resume(s->name);
+            else w.audio.stop(s->name);
+        } else if (c == "audio") {
+            if (!need(t, 2, ln, "audio master v | audio stopall | audio pauseall | audio resumeall")) return;
+            if (t[1] == "master" && t.size() > 2) w.audio.setMasterVolume(std::clamp(num(t[2], ln), 0.0f, 1.0f));
+            else if (t[1] == "stopall") w.audio.stopAll();
+            else if (t[1] == "pauseall") w.audio.pauseAll();
+            else if (t[1] == "resumeall") w.audio.resumeAll();
+            else err(ln, "usage: audio master v | audio stopall | audio pauseall | audio resumeall");
         } else if (c == "camera") {
             if (!need(t, 3, ln, "camera pos x y z | camera look yaw pitch | camera lock on|off")) return;
             if (t[1] == "pos" && t.size() >= 5) {
@@ -1359,6 +1486,22 @@ private:
                 w.giOffscreenRate = static_cast<uint32_t>(std::clamp(num(t[2], ln), 1.0f, 64.0f) + 0.5f);
             else if (t[1] == "cellsize" && t.size() > 2) { w.cacheCellSize = std::max(0.05f, num(t[2], ln)); w.dirty = true; }
             else err(ln, "usage: gi path|cache|screen | gi rate 1|2 | gi offscreen n | gi cellsize v");
+        } else if (c == "ssr_blur") {
+            // Global screen-space reflection blur strength (pixel radius scale).
+            if (!need(t, 2, ln, "ssr_blur <value 0..64>")) return;
+            w.ssrBlur = std::clamp(num(t[1], ln), 0.0f, 64.0f);
+        } else if (c == "ssr_opacity") {
+            // Overall reflection transparency, independent of roughness / Fresnel.
+            if (!need(t, 2, ln, "ssr_opacity <value 0..1>")) return;
+            w.ssrOpacity = std::clamp(num(t[1], ln), 0.0f, 1.0f);
+        } else if (c == "ssr_edge_fade") {
+            // Width of the screen-border fade, in UV units (0 = hard cut, 0.1 = 10% of the screen).
+            if (!need(t, 2, ln, "ssr_edge_fade <value 0..0.5>")) return;
+            w.ssrEdgeFade = std::clamp(num(t[1], ln), 0.0f, 0.5f);
+        } else if (c == "ssr_temporal") {
+            // SSR temporal accumulation: history weight, 0 = off, ~0.9 = about 10 frames.
+            if (!need(t, 2, ln, "ssr_temporal <value 0..0.98>")) return;
+            w.ssrTemporal = std::clamp(num(t[1], ln), 0.0f, 0.98f);
         } else if (c == "shader") {
     if (!need(t, 3, ln, "shader <id> <file> [stage gbuffer|post] [groups x y z] [manual] | shader <id> on|off|run | shader <id> param <slot> <value>")) return;
     CustomShader* s = nullptr;
@@ -1455,7 +1598,7 @@ private:
                 V3 col{sat(std::fabs(h * 6 - 3) - 1) * 0.7f + 0.3f, sat(2 - std::fabs(h * 6 - 2)) * 0.7f + 0.3f, sat(2 - std::fabs(h * 6 - 4)) * 0.7f + 0.3f};
                 LightDef l;
                 l.name = "pl" + std::to_string(placed);
-                l.type = LIGHT_POINT; l.pos = {x, y, z}; l.color = col * (8.0f / float(n)); l.radius = 0.03f; l.range = 4.0f; l.intensity = 20.0f; l.strictAttenuation = false;
+                l.type = LIGHT_POINT; l.pos = {x, y, z}; l.color = col * (8.0f / float(n)); l.radius = 0.03f; l.range = 4.0f; l.intensity = 5.0f; l.strictAttenuation = false;
                 w.lights.push_back(l);
                 ++placed;
             }
