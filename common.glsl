@@ -180,23 +180,31 @@ vec3 previousWorldPos(ivec2 px, float t) {
 
 struct Hit { float t; uint prim; vec2 bary; };
 
-bool traceClosest(vec3 o, vec3 d, float tmax, out Hit h) {
+// Instance masks: 0x01 = full-detail geometry (primary rays), 0x02 = simplified RT proxy (secondary rays).
+// instanceCustomIndex of the proxy instance = index of its first triangle in the tris[] buffer.
+bool traceClosestMask(vec3 o, vec3 d, float tmax, uint mask, out Hit h) {
     h = Hit(0.0, 0u, vec2(0.0));
     rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, gTLAS, gl_RayFlagsOpaqueEXT, 0xFF, o, 1e-4, d, tmax);
+    rayQueryInitializeEXT(rq, gTLAS, gl_RayFlagsOpaqueEXT, mask, o, 1e-4, d, tmax);
     while (rayQueryProceedEXT(rq)) {}
     if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return false;
     h.t    = rayQueryGetIntersectionTEXT(rq, true);
-    h.prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+    h.prim = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true))
+           + uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
     h.bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
     return true;
 }
+
+// primary visibility: full-detail geometry
+bool tracePrimary(vec3 o, vec3 d, float tmax, out Hit h) { return traceClosestMask(o, d, tmax, 0x01u, h); }
+// everything else (GI, reflections, DI hits...): simplified proxy geometry
+bool traceClosest(vec3 o, vec3 d, float tmax, out Hit h) { return traceClosestMask(o, d, tmax, 0x02u, h); }
 
 
 bool occluded(vec3 o, vec3 d, float tmax) {
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, gTLAS, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
-                          0xFF, o, 1e-4, d, tmax);
+                          0x02, o, 1e-4, d, tmax);
     while (rayQueryProceedEXT(rq)) {}
     return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }

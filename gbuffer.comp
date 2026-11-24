@@ -11,7 +11,7 @@ void main() {
 
     vec3 d = primaryDir(px);
     Hit h;
-    if (!traceClosest(U.camPos.xyz, d, 1e4, h)) {
+    if (!tracePrimary(U.camPos.xyz, d, 1e4, h)) {
         imageStore(gND,     ip, vec4(0.0, 0.0, 0.0, -1.0));
         imageStore(gAlbedo, ip, vec4(0.0));
         imageStore(gMaterial, ip, vec4(0.0));

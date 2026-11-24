@@ -31,6 +31,7 @@
 #endif
 
 #include "world.hpp"
+#include "rt_proxy.hpp"
 #include "shader_compiler.hpp"
 
 #define VK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
@@ -793,7 +794,9 @@ int activeDlssMode = 0;
 
     
     Buffer vbuf = createBuffer(size_t(MAX_TRIS) * 9 * sizeof(float), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true);
-    Buffer triBuf = createBuffer(size_t(MAX_TRIS) * sizeof(GpuTri), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    // triBuf / cacheOffBuf hold the full-detail triangles followed by the RT proxy triangles (2 * MAX_TRIS)
+    Buffer vbufRT = createBuffer(size_t(MAX_TRIS) * 9 * sizeof(float), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true);
+    Buffer triBuf = createBuffer(size_t(MAX_TRIS) * 2 * sizeof(GpuTri), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
     Buffer lightBuf = createBuffer(size_t(MAX_LIGHTS) * sizeof(GpuLight), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
     Buffer aliasBuf = createBuffer(size_t(MAX_LIGHTS) * 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
     
@@ -811,7 +814,7 @@ int activeDlssMode = 0;
     const VkBufferUsageFlags cacheUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     Buffer cacheIrr = createBuffer(VkDeviceSize(CACHE_MAX_TEXELS) * 2 * 16, cacheUsage, false);
     Buffer cacheRes = createBuffer(VkDeviceSize(CACHE_MAX_TEXELS) * 2 * 16, cacheUsage, false);
-    Buffer cacheOffBuf = createBuffer((VkDeviceSize(MAX_TRIS) + 1) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    Buffer cacheOffBuf = createBuffer((VkDeviceSize(MAX_TRIS) * 2 + 1) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
 
     VkAccelerationStructureGeometryKHR blasGeom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
     blasGeom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
@@ -826,22 +829,34 @@ int activeDlssMode = 0;
     Accel blas = createAccel(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, blasGeom, MAX_TRIS,
                              asProps.minAccelerationStructureScratchOffsetAlignment);
 
+    // second BLAS: simplified ray-tracing proxy (see rt_proxy.hpp)
+    VkAccelerationStructureGeometryKHR blasGeomRT = blasGeom;
+    blasGeomRT.geometry.triangles.vertexData.deviceAddress = vbufRT.addr;
+    Accel blasRT = createAccel(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR, blasGeomRT, MAX_TRIS,
+                               asProps.minAccelerationStructureScratchOffsetAlignment);
+
     VkAccelerationStructureDeviceAddressInfoKHR dai{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
     dai.accelerationStructure = blas.as;
-    VkAccelerationStructureInstanceKHR inst{};
-    inst.transform.matrix[0][0] = inst.transform.matrix[1][1] = inst.transform.matrix[2][2] = 1.0f;
-    inst.mask = 0xFF;
-    inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-    inst.accelerationStructureReference = pfnGetASAddr(g_dev, &dai);
+    VkAccelerationStructureDeviceAddressInfoKHR daiRT{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+    daiRT.accelerationStructure = blasRT.as;
+    VkAccelerationStructureInstanceKHR inst[2]{};
+    inst[0].transform.matrix[0][0] = inst[0].transform.matrix[1][1] = inst[0].transform.matrix[2][2] = 1.0f;
+    inst[0].mask = 0x01;                         // full-detail geometry: primary rays only
+    inst[0].flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    inst[0].accelerationStructureReference = pfnGetASAddr(g_dev, &dai);
+    inst[1] = inst[0];
+    inst[1].mask = 0x02;                         // proxy geometry: secondary rays (GI, shadows, reflections)
+    inst[1].instanceCustomIndex = 0;             // set to numFullTris in rebuildWorld
+    inst[1].accelerationStructureReference = pfnGetASAddr(g_dev, &daiRT);
     Buffer instBuf = createBuffer(sizeof(inst), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true);
-    std::memcpy(instBuf.map, &inst, sizeof(inst));
+    std::memcpy(instBuf.map, inst, sizeof(inst));
 
     VkAccelerationStructureGeometryKHR tlasGeom{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
     tlasGeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
     tlasGeom.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
     tlasGeom.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
     tlasGeom.geometry.instances.data.deviceAddress = instBuf.addr;
-    Accel tlas = createAccel(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, tlasGeom, 1,
+    Accel tlas = createAccel(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, tlasGeom, 2,
                              asProps.minAccelerationStructureScratchOffsetAlignment);
 
     TexArray texArray = createTexArray();
@@ -1120,6 +1135,7 @@ int activeDlssMode = 0;
         return 1;
     }
     nrd::RelaxSettings nrdDISettings{};
+    nrdDISettings.enableAntiFirefly = true;
     nrdDISettings.diffuseMaxAccumulatedFrameNum = 30;
     nrdDISettings.diffuseMaxFastAccumulatedFrameNum = 5;
     nrdDISettings.specularMaxAccumulatedFrameNum = 30;
@@ -1179,9 +1195,11 @@ int activeDlssMode = 0;
     constexpr uint32_t SOLARI_DI_MODE = 3u;
     uint32_t lightMode = 3;  
     float exposure = 1.0f;
-    uint32_t dbg = 0, giBounces = 1, candIdx = 2;  
+    uint32_t dbg = 0, giBounces = 1, candIdx = 1;  
     const uint32_t candTable[6] = {1, 4, 8, 12, 16, 32};
     uint32_t frame = 0, numLights = 0, numTris = 0, nDir = 0;
+    uint32_t numFullTris = 0, numProxyTris = 0;
+    RtProxyParams rtProxyParams;                         // targetRatio / maxError stuff
     bool nrdWasEnabled = false;
     uint64_t layoutHash = 0;                             
     uint32_t cacheEntries = 0, cacheCursor = 0;          
@@ -1216,10 +1234,19 @@ int activeDlssMode = 0;
     auto rebuildWorld = [&]() -> bool {
         Scene sc;
         sc.cellSize = world.cacheCellSize;
+        sc.proxyMode = true;                             // radiance cache lives on the proxy triangles only
         buildScene(world, sc);
         if (sc.truncated) std::fprintf(stderr, "warning: scene truncated (max %u triangles / %u lights)\n", MAX_TRIS, MAX_LIGHTS);
-        numTris = (uint32_t)sc.tris.size();
+        std::vector<float> proxyVerts;
+        RtProxyStats proxyStats = appendRtProxy(sc, proxyVerts, rtProxyParams);
+        numFullTris = proxyStats.srcTris;
+        numProxyTris = proxyStats.proxyTris;
+        numTris = (uint32_t)sc.tris.size();              // triBuf = full-detail tris followed by proxy tris
+        std::printf("RT proxy: %u -> %u triangles\n", numFullTris, numProxyTris);
         std::memcpy(vbuf.map, sc.verts.data(), sc.verts.size() * sizeof(float));
+        std::memcpy(vbufRT.map, proxyVerts.data(), proxyVerts.size() * sizeof(float));
+        inst[1].instanceCustomIndex = numFullTris;
+        std::memcpy(instBuf.map, inst, sizeof(inst));
         std::memcpy(triBuf.map, sc.tris.data(), sc.tris.size() * sizeof(GpuTri));
         uint32_t nl = (uint32_t)sc.lights.size();
         auto mid = std::stable_partition(sc.lights.begin(), sc.lights.end(),
@@ -1512,13 +1539,14 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qpool, 0);
 
         if (rebuilt) {                                   
-            recordBuild(cmd, blas, blasGeom, numTris);
+            recordBuild(cmd, blas, blasGeom, numFullTris);
+            recordBuild(cmd, blasRT, blasGeomRT, numProxyTris);
             VkMemoryBarrier asb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             asb.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
             asb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                                  0, 1, &asb, 0, nullptr, 0, nullptr);
-            recordBuild(cmd, tlas, tlasGeom, 1);
+            recordBuild(cmd, tlas, tlasGeom, 2);
             asb.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 1, &asb, 0, nullptr, 0, nullptr);

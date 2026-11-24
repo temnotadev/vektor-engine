@@ -17,6 +17,11 @@ if(NOT glfw3_FOUND)
   FetchContent_MakeAvailable(glfw)
 endif()
 
+# mesh lods
+include(FetchContent)
+FetchContent_Declare(meshoptimizer GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git GIT_TAG v0.22)
+FetchContent_MakeAvailable(meshoptimizer)
+
 set(REBLUR_PERFORMANCE_MODE ON CACHE BOOL "" FORCE)
 
 # denoiser nrd integration
@@ -66,7 +71,7 @@ else()
   message(FATAL_ERROR "main.cpp not found next to CMakeLists.txt or in src/")
 endif()
 add_executable(rt_renderer ${MAIN_CPP} ${CMAKE_CURRENT_SOURCE_DIR}/physics.cpp ${CMAKE_CURRENT_SOURCE_DIR}/audio.cpp)
-target_link_libraries(rt_renderer PRIVATE Vulkan::Vulkan glfw NRD NRI NRDIntegration Jolt)
+target_link_libraries(rt_renderer PRIVATE Vulkan::Vulkan glfw NRD NRI NRDIntegration Jolt meshoptimizer)
 if(WIN32)
   target_link_libraries(rt_renderer PRIVATE ole32 winmm)
 endif()

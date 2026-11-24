@@ -671,6 +671,7 @@ struct Scene {
     uint64_t layoutHash = 1469598103934665603ull;
     float cellSize = 0.3f;
     bool dummy = false;
+    bool proxyMode = false;   // true: full-detail tris get no radiance-cache slots (only RT proxy tris do)
     V3 bmin{1e30f, 1e30f, 1e30f}, bmax{-1e30f, -1e30f, -1e30f};
 
     void addTri(V3 a, V3 b, V3 c, V3 albedo, V3 emission, const float uv[3][2], int layer, float footprint,
@@ -690,7 +691,7 @@ struct Scene {
             float longest = std::max({length(e0), length(e1), length(e2)});
             float area2 = length(cross(b - a, c - a)) * 0.5f;
             uint32_t k = 0, n = 0;
-            if (albedo.x + albedo.y + albedo.z > 1e-4f && area2 > 1e-8f) {
+            if (!proxyMode && albedo.x + albedo.y + albedo.z > 1e-4f && area2 > 1e-8f) {
                 k = (uint32_t)std::min(32.0f, std::max(1.0f, std::ceil(longest / std::max(cellSize, 0.02f))));
                 n = k * (k + 1) / 2;
                 if (cacheTexels + n > CACHE_MAX_TEXELS) { k = 1; n = 1; }          
