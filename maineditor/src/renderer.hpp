@@ -7,6 +7,7 @@
 #include "fbxloader.hpp"
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct GPUMesh {
@@ -48,6 +49,7 @@ public:
 
     bool hasMesh(const std::string& id) const { return meshes_.count(id) > 0; }
     bool hasFBXModel(const std::string& id) const { return fbxMeshes_.count(id) > 0; }
+    bool meshBounds(const std::string& id, Vec3& mn, Vec3& mx) const;
     const std::vector<FBXMaterialInfo>* fbxMaterials(const std::string& id) const;
     bool hasTexture(const std::string& id) const { return textures_.count(id) > 0; }
     const std::unordered_map<std::string, GPUMesh>& meshes()   const { return meshes_; }
@@ -73,6 +75,7 @@ public:
 private:
     GLuint program_ = 0;
     std::unordered_map<std::string, GPUMesh> meshes_;
+    std::unordered_map<std::string, std::pair<Vec3, Vec3>> meshBounds_;
     std::unordered_map<std::string, Texture> textures_;
     std::unordered_map<std::string, std::vector<FBXGPUMeshPart>> fbxMeshes_;
     std::unordered_map<std::string, std::vector<FBXMaterialInfo>> fbxMaterials_;

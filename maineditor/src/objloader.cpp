@@ -80,7 +80,9 @@ bool loadOBJ(const std::string& path, MeshData& out, bool raw) {
             mn.y = std::min(mn.y, out.vertices[i+1]); mx.y = std::max(mx.y, out.vertices[i+1]);
             mn.z = std::min(mn.z, out.vertices[i+2]); mx.z = std::max(mx.z, out.vertices[i+2]);
         }
-        Vec3 c = (mn + mx) * 0.5f;
+        // Match the engine's model fitting: center on X/Z but keep the bottom
+        // of the model on the pivot so scale/position look identical in playtest.
+        Vec3 c((mn.x + mx.x) * 0.5f, mn.y, (mn.z + mx.z) * 0.5f);
         float md = std::max(std::max(mx.x - mn.x, mx.y - mn.y), mx.z - mn.z);
         if (md < 1e-6f) md = 1.0f;
         float s = 1.0f / md;

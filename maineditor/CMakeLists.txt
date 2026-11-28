@@ -83,9 +83,11 @@ add_executable(scr_editor
   src/objloader.cpp
   src/fbxloader.cpp
   src/texture.cpp
+  ../audio.cpp
 )
 target_link_libraries(scr_editor PRIVATE imgui_lib glfw ${GLEW_TARGET} assimp::assimp)
+target_include_directories(scr_editor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty)
 if (WIN32)
-  target_link_libraries(scr_editor PRIVATE dwmapi)
+  target_link_libraries(scr_editor PRIVATE dwmapi ole32 winmm)
 endif()
 target_compile_definitions(scr_editor PRIVATE GLEW_STATIC)

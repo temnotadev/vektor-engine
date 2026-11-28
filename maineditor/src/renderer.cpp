@@ -198,11 +198,36 @@ void Renderer::uploadMesh(const MeshData& m, GPUMesh& mesh) {
     mesh.indexCount = (GLuint)m.indices.size();
 }
 
+static void computeMeshBounds(const MeshData& m, Vec3& mn, Vec3& mx) {
+    mn = Vec3(1e30f, 1e30f, 1e30f);
+    mx = Vec3(-1e30f, -1e30f, -1e30f);
+    for (size_t i = 0; i + 8 <= m.vertices.size(); i += 8) {
+        mn.x = std::min(mn.x, m.vertices[i + 0]);
+        mn.y = std::min(mn.y, m.vertices[i + 1]);
+        mn.z = std::min(mn.z, m.vertices[i + 2]);
+        mx.x = std::max(mx.x, m.vertices[i + 0]);
+        mx.y = std::max(mx.y, m.vertices[i + 1]);
+        mx.z = std::max(mx.z, m.vertices[i + 2]);
+    }
+    if (mn.x > mx.x) { mn = Vec3(-0.5f, -0.5f, -0.5f); mx = Vec3(0.5f, 0.5f, 0.5f); }
+}
+
+bool Renderer::meshBounds(const std::string& id, Vec3& mn, Vec3& mx) const {
+    const auto it = meshBounds_.find(id);
+    if (it == meshBounds_.end()) return false;
+    mn = it->second.first;
+    mx = it->second.second;
+    return true;
+}
+
 bool Renderer::ensureMesh(const std::string& id, const MeshData& data) {
     if (meshes_.count(id)) return true;
     GPUMesh m;
     uploadMesh(data, m);
     meshes_[id] = m;
+    Vec3 mn, mx;
+    computeMeshBounds(data, mn, mx);
+    meshBounds_[id] = {mn, mx};
     return true;
 }
 
@@ -215,10 +240,14 @@ bool Renderer::loadModelOBJ(const std::string& id, const std::string& path, bool
         glDeleteBuffers(1, &it->second.vbo);
         glDeleteBuffers(1, &it->second.ibo);
         meshes_.erase(it);
+        meshBounds_.erase(id);
     }
     GPUMesh m;
     uploadMesh(data, m);
     meshes_[id] = m;
+    Vec3 mn, mx;
+    computeMeshBounds(data, mn, mx);
+    meshBounds_[id] = {mn, mx};
     return true;
 }
 
@@ -236,18 +265,28 @@ bool Renderer::loadModelFBX(const std::string& id, const std::string& path) {
         glDeleteBuffers(1, &it->second.vbo);
         glDeleteBuffers(1, &it->second.ibo);
         meshes_.erase(it);
+        meshBounds_.erase(id);
     }
 
     std::vector<FBXGPUMeshPart> parts;
     parts.reserve(data.parts.size());
+    Vec3 boundsMin(1e30f, 1e30f, 1e30f);
+    Vec3 boundsMax(-1e30f, -1e30f, -1e30f);
     for (const FBXMeshPart& source : data.parts) {
         FBXGPUMeshPart part;
         part.materialIndex = source.materialIndex;
         uploadMesh(source.mesh, part.mesh);
         parts.push_back(part);
+
+        Vec3 mn, mx;
+        computeMeshBounds(source.mesh, mn, mx);
+        boundsMin.x = std::min(boundsMin.x, mn.x); boundsMin.y = std::min(boundsMin.y, mn.y); boundsMin.z = std::min(boundsMin.z, mn.z);
+        boundsMax.x = std::max(boundsMax.x, mx.x); boundsMax.y = std::max(boundsMax.y, mx.y); boundsMax.z = std::max(boundsMax.z, mx.z);
     }
+    if (boundsMin.x > boundsMax.x) { boundsMin = Vec3(-0.5f, -0.5f, -0.5f); boundsMax = Vec3(0.5f, 0.5f, 0.5f); }
     fbxMeshes_[id] = std::move(parts);
     fbxMaterials_[id] = std::move(data.materials);
+    meshBounds_[id] = {boundsMin, boundsMax};
     return true;
 }
 
@@ -267,6 +306,7 @@ void Renderer::deleteFBXModel(const std::string& id) {
         fbxMeshes_.erase(it);
     }
     fbxMaterials_.erase(id);
+    meshBounds_.erase(id);
 }
 
 bool Renderer::loadTextureFile(const std::string& id, const std::string& path) {
@@ -296,6 +336,7 @@ void Renderer::reloadAssets(const std::unordered_map<std::string, ModelEntry>& m
         glDeleteVertexArrays(1, &it->second.vao);
         glDeleteBuffers(1, &it->second.vbo);
         glDeleteBuffers(1, &it->second.ibo);
+        meshBounds_.erase(id);
         it = meshes_.erase(it);
     }
     for (auto& [k, v] : textures_) if (v.id) glDeleteTextures(1, &v.id);
@@ -340,6 +381,7 @@ void Renderer::shutdown() {
         glDeleteBuffers(1, &m.ibo);
     }
     meshes_.clear();
+    meshBounds_.clear();
     for (auto& [id, parts] : fbxMeshes_) {
         for (const FBXGPUMeshPart& part : parts) {
             glDeleteVertexArrays(1, &part.mesh.vao);

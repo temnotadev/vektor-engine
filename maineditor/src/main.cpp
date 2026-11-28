@@ -6,6 +6,7 @@
 #include "glmath.hpp"
 #include "scene.hpp"
 #include "renderer.hpp"
+#include "audio.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -35,9 +36,6 @@
 #include "texture.hpp"
 #include "stb_image.h"
 
-// -----------------------------------------------------------------------------
-// Asset / file helpers
-// -----------------------------------------------------------------------------
 bool LoadUIAsset(const std::string& filename, GLuint& outTex) {
     Texture tex;
     std::vector<std::string> paths = {
@@ -153,7 +151,6 @@ static ImGuiKey scriptKeyToImGuiKey(std::string key) {
     return ImGuiKey_None;
 }
 
-// ---- screen / plane / AABB helpers ----
 static Ray screenRay(float mx, float my, int w, int h, const Mat4& view, const Mat4& proj) {
     float nx = (2.0f * mx) / w - 1.0f;
     float ny = 1.0f - (2.0f * my) / h;
@@ -201,7 +198,6 @@ static bool rayAABB(const Ray& r, const Vec3& mn, const Vec3& mx, float& tOut) {
     return tmax >= 0;
 }
 
-// ---- UE5-Style Free-Fly Camera ----
 struct Camera {
     Vec3 pos{4.0f, 4.0f, 6.0f};
     float yaw = -33.7f;
@@ -226,7 +222,7 @@ struct Camera {
     }
 };
 
-enum class PlaceMode { None, Cube, Sphere, Collider, PointLight, SpotLight };
+enum class PlaceMode { None, Cube, Sphere, Collider, PointLight, SpotLight, Sound };
 enum class GizmoMode { Move, Scale };
 enum class GizmoAxis { None = -1, X = 0, Y = 1, Z = 2, Center = 3 };
 
@@ -242,13 +238,16 @@ struct GizmoDrag {
     Vec3      startHit{0,0,0};
     float     startAxisParam = 0.0f;
     ImVec2    startMouse{0,0};
+    Vec3      gizmoRot{0,0,0};         // local orientation for the scale gizmo
     bool      isLight = false;
+    bool      isSound = false;
 };
 
 struct Editor {
     Scene      scene;
     Camera     camera;
     Renderer   renderer;
+    AudioSystem audio;
 
     PlaceMode   placeMode = PlaceMode::None;
     GizmoMode   gizmoMode = GizmoMode::Move;
@@ -256,6 +255,7 @@ struct Editor {
     int         hoverAxis = -1;
     int         selectedObj   = -1;
     int         selectedLight = -1;
+    int         selectedSound = -1;
     std::string selectedMaterialId;
 
     std::string scriptText;
@@ -275,31 +275,42 @@ struct Editor {
             spawnPos.y += 0.5f;
             selectedObj = scene.addObject(ObjType::Cube, spawnPos, {1,1,1}, {0.8f,0.6f,0.4f});
             selectedLight = -1;
+            selectedSound = -1;
         } else if (mode == PlaceMode::Sphere) {
             spawnPos.y += 0.5f;
             selectedObj = scene.addObject(ObjType::Sphere, spawnPos, {1,1,1}, {0.4f,0.65f,0.9f});
             selectedLight = -1;
+            selectedSound = -1;
         } else if (mode == PlaceMode::Collider) {
             selectedObj = scene.addObject(ObjType::Cube, spawnPos, {1,1,1}, {0.2f,0.8f,1.0f});
             scene.objects[selectedObj].collisionOnly = true;
             scene.objects[selectedObj].physicsEnabled = true;
             selectedLight = -1;
+            selectedSound = -1;
         } else if (mode == PlaceMode::PointLight) {
             spawnPos.y += 2.5f;
             selectedLight = scene.addPointLight(spawnPos, {1,0.95f,0.85f}, 10.0f);
             selectedObj = -1;
+            selectedSound = -1;
         } else if (mode == PlaceMode::SpotLight) {
             spawnPos.y += 3.5f;
             selectedLight = scene.addSpotLight(spawnPos, {0,-1,0}, {1,0.9f,0.7f}, 15.0f, 40.0f, 18.0f);
             selectedObj = -1;
+            selectedSound = -1;
+        } else if (mode == PlaceMode::Sound) {
+            const std::string path = OpenFileDialog(
+                "Audio Files\0*.mp3;*.wav;*.ogg;*.flac\0MP3 Files\0*.mp3\0All Files\0*.*\0");
+            if (!path.empty()) {
+                selectedSound = scene.addSound(spawnPos, path);
+                selectedObj = -1;
+                selectedLight = -1;
+                if (audio.ready()) audio.load(scene.sounds[selectedSound].name, path);
+            }
         }
         regenerate();
     }
 };
 
-// -----------------------------------------------------------------------------
-// Material helpers (mirror the engine's `material` command)
-// -----------------------------------------------------------------------------
 static std::string MakeUniqueMaterialId(const Scene& scene, const std::string& requestedId) {
     const std::string base = MakeAssetId(requestedId);
     std::string id = base;
@@ -369,13 +380,29 @@ static bool DrawMaterialEditor(Editor& ed, Material& material, const std::string
     return changed;
 }
 
-// -----------------------------------------------------------------------------
-// 3D Gizmo helpers (translate arrows / scale handles)
-// -----------------------------------------------------------------------------
-static Vec3 gizmoAxisDir(int axis) {
-    if (axis == 0) return Vec3(1, 0, 0);
-    if (axis == 1) return Vec3(0, 1, 0);
-    return Vec3(0, 0, 1);
+// Half-size (pixels) of the screen-space light marker icon. Shared by the
+// drawing and picking code so the clickable area always matches the icon.
+static constexpr float kLightGizmoIconHalf = 30.0f;
+
+// Euler rotation matching the engine's rotateEuler (X, then Y, then Z).
+static Vec3 rotateEulerDeg(const Vec3& p, const Vec3& deg) {
+    const float d2r = 3.14159265f / 180.0f;
+    const float rx = deg.x * d2r, ry = deg.y * d2r, rz = deg.z * d2r;
+    const float cx = std::cos(rx), sx = std::sin(rx);
+    const float cy = std::cos(ry), sy = std::sin(ry);
+    const float cz = std::cos(rz), sz = std::sin(rz);
+    Vec3 r = p;
+    r = Vec3(r.x, r.y * cx - r.z * sx, r.y * sx + r.z * cx);
+    r = Vec3(r.x * cy + r.z * sy, r.y, -r.x * sy + r.z * cy);
+    r = Vec3(r.x * cz - r.y * sz, r.x * sz + r.y * cz, r.z);
+    return r;
+}
+
+static Vec3 gizmoAxisDir(int axis, const Vec3& rotation = Vec3(0, 0, 0)) {
+    Vec3 dir = (axis == 0) ? Vec3(1, 0, 0) : (axis == 1) ? Vec3(0, 1, 0) : Vec3(0, 0, 1);
+    if (rotation.x != 0.0f || rotation.y != 0.0f || rotation.z != 0.0f)
+        dir = rotateEulerDeg(dir, rotation);
+    return dir;
 }
 
 static Vec3 gizmoAxisColor(int axis) {
@@ -441,7 +468,7 @@ static bool rayPlanePoint(const Ray& r, const Vec3& planePoint, const Vec3& plan
 // Returns axis 0..2, 3 for the center handle, or -1.
 static int pickGizmoAxis(const ImVec2& mouse, const Vec3& origin, GizmoMode mode,
                          const Camera& camera, const Mat4& view, const Mat4& proj,
-                         int vpW, int vpH) {
+                         int vpW, int vpH, const Vec3& rotation = Vec3(0, 0, 0)) {
     const float len = gizmoLength(camera, origin, proj, vpH);
     ImVec2 center;
     if (!projectToScreen(origin, view, proj, vpW, vpH, center)) return -1;
@@ -455,7 +482,7 @@ static int pickGizmoAxis(const ImVec2& mouse, const Vec3& origin, GizmoMode mode
     float bestDist = 11.0f;
     for (int axis = 0; axis < 3; ++axis) {
         ImVec2 tip;
-        if (!projectToScreen(origin + gizmoAxisDir(axis) * len, view, proj, vpW, vpH, tip))
+        if (!projectToScreen(origin + gizmoAxisDir(axis, rotation) * len, view, proj, vpW, vpH, tip))
             continue;
         const float d = distanceToSegment2D(mouse, center, tip);
         if (d < bestDist) { bestDist = d; best = axis; }
@@ -466,7 +493,7 @@ static int pickGizmoAxis(const ImVec2& mouse, const Vec3& origin, GizmoMode mode
 
 static void drawGizmo(Renderer& renderer, const Vec3& origin, GizmoMode mode,
                       int hoverAxis, int dragAxis, const Camera& camera,
-                      const Mat4& proj, int vpH) {
+                      const Mat4& proj, int vpH, const Vec3& rotation = Vec3(0, 0, 0)) {
     const float wpp = gizmoWorldPerPixel(camera, origin, proj, vpH);
     const float len = gizmoLength(camera, origin, proj, vpH);
     const float headLen = len * 0.22f;
@@ -477,7 +504,7 @@ static void drawGizmo(Renderer& renderer, const Vec3& origin, GizmoMode mode,
 
     renderer.setDepthTest(false);
     for (int axis = 0; axis < 3; ++axis) {
-        const Vec3 dir = gizmoAxisDir(axis);
+        const Vec3 dir = gizmoAxisDir(axis, rotation);
         const bool hot = (hoverAxis == axis || dragAxis == axis);
         Vec3 color = gizmoAxisColor(axis);
         if (hot) color = Vec3(std::min(1.0f, color.x + 0.35f),
@@ -508,29 +535,47 @@ static void drawGizmo(Renderer& renderer, const Vec3& origin, GizmoMode mode,
     renderer.setDepthTest(true);
 }
 
-// World-space AABB of an object (accounts for rotation and size).
-static void objectWorldAABB(const SceneObject& o, Vec3& mn, Vec3& mx) {
+// Local-space bounds of the mesh an object renders with.
+static void objectLocalBounds(const Renderer& renderer, const SceneObject& o, Vec3& mn, Vec3& mx) {
+    std::string meshId = "cube";
+    if (!o.collisionOnly) {
+        if (!o.modelId.empty()) meshId = o.modelId;
+        else if (o.type == ObjType::Sphere) meshId = "sphere";
+        else if (o.type == ObjType::Quad)   meshId = "quad";
+    }
+    if (!renderer.meshBounds(meshId, mn, mx)) {
+        mn = Vec3(-0.5f, -0.5f, -0.5f);
+        mx = Vec3( 0.5f,  0.5f,  0.5f);
+    }
+}
+
+// World-space AABB of an object (accounts for rotation, size and mesh pivot).
+static void objectWorldAABB(const Renderer& renderer, const SceneObject& o, Vec3& mn, Vec3& mx) {
     const Mat4 model = modelMatrix(o);
+    Vec3 localMin, localMax;
+    objectLocalBounds(renderer, o, localMin, localMax);
     mn = Vec3( 1e30f,  1e30f,  1e30f);
     mx = Vec3(-1e30f, -1e30f, -1e30f);
     for (int i = 0; i < 8; ++i) {
-        const Vec3 corner((i & 1) ? 0.5f : -0.5f,
-                          (i & 2) ? 0.5f : -0.5f,
-                          (i & 4) ? 0.5f : -0.5f);
+        const Vec3 corner((i & 1) ? localMax.x : localMin.x,
+                          (i & 2) ? localMax.y : localMin.y,
+                          (i & 4) ? localMax.z : localMin.z);
         const Vec3 p = transformPoint(model, corner);
         mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
         mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
     }
 }
 
-// Draws the object bounds as an oriented box matching its rotation.
+// Draws the object bounds as an oriented box matching its rotation and pivot.
 static void drawObjectOutline(Renderer& renderer, const SceneObject& o, const Vec3& color) {
     const Mat4 model = modelMatrix(o);
+    Vec3 localMin, localMax;
+    objectLocalBounds(renderer, o, localMin, localMax);
     Vec3 corners[8];
     for (int i = 0; i < 8; ++i) {
-        corners[i] = transformPoint(model, Vec3((i & 1) ? 0.5f : -0.5f,
-                                                (i & 2) ? 0.5f : -0.5f,
-                                                (i & 4) ? 0.5f : -0.5f));
+        corners[i] = transformPoint(model, Vec3((i & 1) ? localMax.x : localMin.x,
+                                                (i & 2) ? localMax.y : localMin.y,
+                                                (i & 4) ? localMax.z : localMin.z));
     }
     const int edges[12][2] = {{0,1},{1,3},{3,2},{2,0},{4,5},{5,7},{7,6},{6,4},
                               {0,4},{1,5},{2,6},{3,7}};
@@ -545,9 +590,6 @@ static void drawObjectOutline(Renderer& renderer, const SceneObject& o, const Ve
     renderer.drawLineSegments(verts, color);
 }
 
-// -----------------------------------------------------------------------------
-// Laura-style theme
-// -----------------------------------------------------------------------------
 static const ImVec4 kAccent      = ImVec4(0.24f, 0.51f, 0.95f, 1.00f);
 static const ImVec4 kAccentHover = ImVec4(0.33f, 0.60f, 1.00f, 1.00f);
 static const ImVec4 kTextMuted   = ImVec4(0.55f, 0.55f, 0.55f, 1.00f);
@@ -625,9 +667,6 @@ static void ApplyLauraTheme() {
     style.GrabMinSize       = 8.0f;
 }
 
-// -----------------------------------------------------------------------------
-// Small custom-drawn glyphs
-// -----------------------------------------------------------------------------
 static void DrawChevron(ImDrawList* dl, ImVec2 center, float size, bool down, ImU32 col) {
     if (down) {
         dl->AddTriangleFilled(ImVec2(center.x - size * 0.5f, center.y - size * 0.28f),
@@ -667,30 +706,30 @@ static void DrawTrashIcon(ImDrawList* dl, ImVec2 pos, float size, ImU32 col) {
 }
 
 static void DrawComponentGlyph(ImDrawList* dl, ImVec2 c, int kind, ImU32 col) {
-    if (kind == 0) { // transform
+    if (kind == 0) {
         dl->AddLine(ImVec2(c.x - 5, c.y), ImVec2(c.x + 5, c.y), col, 1.3f);
         dl->AddLine(ImVec2(c.x, c.y - 5), ImVec2(c.x, c.y + 5), col, 1.3f);
         dl->AddTriangleFilled(ImVec2(c.x + 6, c.y), ImVec2(c.x + 3, c.y - 2), ImVec2(c.x + 3, c.y + 2), col);
         dl->AddTriangleFilled(ImVec2(c.x - 6, c.y), ImVec2(c.x - 3, c.y - 2), ImVec2(c.x - 3, c.y + 2), col);
         dl->AddTriangleFilled(ImVec2(c.x, c.y - 6), ImVec2(c.x - 2, c.y - 3), ImVec2(c.x + 2, c.y - 3), col);
         dl->AddTriangleFilled(ImVec2(c.x, c.y + 6), ImVec2(c.x - 2, c.y + 3), ImVec2(c.x + 2, c.y + 3), col);
-    } else if (kind == 1) { // appearance
+    } else if (kind == 1) {
         dl->AddCircle(c, 5.0f, col, 14, 1.2f);
         dl->AddCircleFilled(ImVec2(c.x + 1.4f, c.y - 1.4f), 1.8f, col);
-    } else if (kind == 2) { // material
+    } else if (kind == 2) {
         dl->AddCircle(c, 5.0f, col, 14, 1.2f);
         dl->AddLine(ImVec2(c.x - 4.3f, c.y + 1.6f), ImVec2(c.x + 4.3f, c.y + 1.6f), col, 1.0f);
-    } else if (kind == 3) { // physics
+    } else if (kind == 3) {
         dl->AddRect(ImVec2(c.x - 4.5f, c.y - 4.5f), ImVec2(c.x + 4.5f, c.y + 4.5f), col, 1.0f, 0, 1.2f);
         dl->AddCircleFilled(c, 1.9f, col);
-    } else if (kind == 4) { // light
+    } else if (kind == 4) {
         dl->AddCircle(c, 3.6f, col, 12, 1.2f);
         for (int i = 0; i < 8; ++i) {
             const float a = (float)i * 3.14159265f * 0.25f;
             dl->AddLine(ImVec2(c.x + std::cos(a) * 5.2f, c.y + std::sin(a) * 5.2f),
                         ImVec2(c.x + std::cos(a) * 6.6f, c.y + std::sin(a) * 6.6f), col, 1.1f);
         }
-    } else { // generic
+    } else {
         dl->AddRect(ImVec2(c.x - 4.5f, c.y - 4.5f), ImVec2(c.x + 4.5f, c.y + 4.5f), col, 1.0f, 0, 1.2f);
     }
 }
@@ -737,9 +776,6 @@ static std::string EllipsizeText(const std::string& text, float maxWidth) {
     return result + suffix;
 }
 
-// -----------------------------------------------------------------------------
-// Custom dark title bar (Laura-style)
-// -----------------------------------------------------------------------------
 static const float kTitleBarHeight = 32.0f;
 static const ImVec4 kTitleBarBg = ImVec4(0.075f, 0.075f, 0.075f, 1.0f);
 
@@ -819,7 +855,6 @@ static void DrawAppTitleBar(GLFWwindow* win, GLuint iconTex, const std::string& 
     float menuRight = 0.0f;
 
     if (ImGui::BeginMenuBar()) {
-        // App icon
         const float iconSize = 18.0f;
         const ImVec2 iconMin(barPos.x + 12.0f, barPos.y + (barH - iconSize) * 0.5f);
         if (iconTex) {
@@ -835,7 +870,6 @@ static void DrawAppTitleBar(GLFWwindow* win, GLuint iconTex, const std::string& 
         drawMenus();
         menuRight = ImGui::GetCursorScreenPos().x - barPos.x;
 
-        // Centered project folder name
         const float maxLabelW = std::min(barW * 0.40f, rightStart - menuRight - 24.0f);
         if (maxLabelW > 24.0f) {
             const std::string label = EllipsizeText(projectName, maxLabelW);
@@ -848,7 +882,6 @@ static void DrawAppTitleBar(GLFWwindow* win, GLuint iconTex, const std::string& 
         }
 
         if (showPerf) {
-            // Simulate button
             ImGui::SetCursorScreenPos(ImVec2(barPos.x + playX, barPos.y));
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1, 1, 1, 0.08f));
@@ -866,13 +899,11 @@ static void DrawAppTitleBar(GLFWwindow* win, GLuint iconTex, const std::string& 
             ImGui::PopStyleVar();
             ImGui::PopStyleColor(4);
 
-            // FPS readout
             ImGui::SetCursorScreenPos(ImVec2(barPos.x + fpsX,
                                              barPos.y + (barH - ImGui::GetTextLineHeight()) * 0.5f - padY));
             ImGui::TextColored(kTextMuted, "%s", fpsLabel);
         }
 
-        // Window controls
         ImGui::SetCursorScreenPos(ImVec2(barPos.x + barW - btnW * 3.0f, barPos.y));
         if (TitleBarButton("##minimize", btnW, barH, false)) glfwIconifyWindow(win);
         {
@@ -904,7 +935,6 @@ static void DrawAppTitleBar(GLFWwindow* win, GLuint iconTex, const std::string& 
                            IM_COL32(225, 225, 225, 255));
         }
 
-        // Bottom separator line
         dl->AddLine(ImVec2(barPos.x, barPos.y + barH - 0.5f),
                     ImVec2(barPos.x + barW, barPos.y + barH - 0.5f),
                     IM_COL32(0, 0, 0, 255), 1.0f);
@@ -912,7 +942,6 @@ static void DrawAppTitleBar(GLFWwindow* win, GLuint iconTex, const std::string& 
         ImGui::EndMenuBar();
     }
 
-    // ---- Window dragging (empty title bar area) ----
     static bool dragging = false;
     static ImVec2 dragStartCursor;
     static ImVec2 dragStartWindow;
@@ -1035,9 +1064,6 @@ static void HandleWindowBorderResize(GLFWwindow* win) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Panel / component headers
-// -----------------------------------------------------------------------------
 struct PanelTabDef {
     const char* label;
     GLuint icon;
@@ -1189,9 +1215,6 @@ static bool ViewportModeButton(const char* id, const char* label, bool active) {
     return clicked;
 }
 
-// -----------------------------------------------------------------------------
-// Import helpers
-// -----------------------------------------------------------------------------
 static std::string ModelIdForPath(Editor& ed, const std::filesystem::path& modelPath) {
     const std::string base = MakeAssetId(modelPath.stem().string());
     std::string id = base;
@@ -1269,15 +1292,40 @@ static void ImportTextureDialog(Editor& ed) {
     if (!path.empty()) RegisterTextureFile(ed, path);
 }
 
+static Vec3 CameraSpawnPosition(const Camera& camera) {
+    Vec3 fwd = camera.forward();
+    Vec3 spawnPos = camera.pos + fwd * 10.0f;
+    if (fwd.y < -0.01f) {
+        float t = -camera.pos.y / fwd.y;
+        if (t > 0) spawnPos = camera.pos + fwd * t;
+    }
+    return spawnPos;
+}
+
+static bool RegisterSoundFile(Editor& ed, const std::string& path) {
+    if (path.empty()) return false;
+    Vec3 spawnPos = CameraSpawnPosition(ed.camera);
+    spawnPos.y += 1.0f;
+    ed.selectedSound = ed.scene.addSound(spawnPos, path);
+    ed.selectedObj = -1;
+    ed.selectedLight = -1;
+    if (ed.audio.ready()) ed.audio.load(ed.scene.sounds[ed.selectedSound].name, path);
+    ed.regenerate();
+    return true;
+}
+
+static void ImportSoundDialog(Editor& ed) {
+    const std::string path = OpenFileDialog(
+        "Audio Files\0*.mp3;*.wav;*.ogg;*.flac\0MP3 Files\0*.mp3\0All Files\0*.*\0");
+    if (!path.empty()) RegisterSoundFile(ed, path);
+}
+
 static std::string ObjectKindLabel(const SceneObject& o) {
     if (o.collisionOnly) return "collider";
     if (!o.modelId.empty()) return o.modelId;
     return objTypeName(o.type);
 }
 
-// -----------------------------------------------------------------------------
-// Inspector
-// -----------------------------------------------------------------------------
 static void DrawInspectorObject(Editor& ed) {
     auto& o = ed.scene.objects[ed.selectedObj];
     static bool openTransform = true;
@@ -1285,7 +1333,6 @@ static void DrawInspectorObject(Editor& ed) {
     static bool openMaterial = false;
     static bool openPhysics = false;
 
-    // Name
     ImGui::TextColored(kTextMuted, "Name:");
     ImGui::SameLine(64.0f);
     char nameBuf[160];
@@ -1301,7 +1348,6 @@ static void DrawInspectorObject(Editor& ed) {
     ImGui::TextColored(kTextMuted, "Type: %s", ObjectKindLabel(o).c_str());
     ImGui::Dummy(ImVec2(0, 3));
 
-    // Transform
     if (ComponentHeader("Transform", &openTransform, 0)) {
         ImGui::Dummy(ImVec2(0, 2));
         bool changed = false;
@@ -1313,7 +1359,6 @@ static void DrawInspectorObject(Editor& ed) {
     }
     ImGui::Dummy(ImVec2(0, 3));
 
-    // Appearance
     if (ComponentHeader("Appearance", &openAppearance, 1)) {
         ImGui::PushItemWidth(-92.0f);
         if (ImGui::ColorEdit3("Color", &o.color.x)) ed.regenerate();
@@ -1322,7 +1367,6 @@ static void DrawInspectorObject(Editor& ed) {
     }
     ImGui::Dummy(ImVec2(0, 3));
 
-    // Material
     if (ComponentHeader("Material", &openMaterial, 2)) {
         const char* currentMaterial = o.materialId.empty() ? "<none>" : o.materialId.c_str();
         ImGui::TextColored(kTextMuted, "Material");
@@ -1410,7 +1454,6 @@ static void DrawInspectorObject(Editor& ed) {
     }
     ImGui::Dummy(ImVec2(0, 3));
 
-    // Physics
     if (ComponentHeader("Physics", &openPhysics, 3)) {
         ImGui::PushItemWidth(-112.0f);
         bool physicsChanged = ImGui::Checkbox("Physics Body", &o.physicsEnabled);
@@ -1432,7 +1475,6 @@ static void DrawInspectorObject(Editor& ed) {
     }
     ImGui::Dummy(ImVec2(0, 4));
 
-    // Add Component
     const float addW = 150.0f;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
                          (ImGui::GetContentRegionAvail().x - addW) * 0.5f);
@@ -1535,6 +1577,106 @@ static void DrawInspectorLight(Editor& ed) {
     ImGui::PopStyleColor(3);
 }
 
+static void DrawInspectorSound(Editor& ed) {
+    auto& s = ed.scene.sounds[ed.selectedSound];
+    static bool openTransform = true;
+    static bool openSound = true;
+
+    ImGui::TextColored(kTextMuted, "Name:");
+    ImGui::SameLine(64.0f);
+    char nameBuf[160];
+    std::snprintf(nameBuf, sizeof(nameBuf), "%s", s.name.c_str());
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.12f, 0.12f, 0.12f, 1.0f));
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::InputText("##soundName", nameBuf, sizeof(nameBuf))) {
+        if (ed.audio.exists(s.name)) {
+            ed.audio.stop(s.name);
+            ed.audio.unload(s.name);
+        }
+        s.name = nameBuf;
+        ed.regenerate();
+    }
+    ImGui::PopStyleColor();
+
+    ImGui::TextColored(kTextMuted, "Type: sound");
+    ImGui::Dummy(ImVec2(0, 3));
+
+    if (ComponentHeader("Transform", &openTransform, 0)) {
+        ImGui::Dummy(ImVec2(0, 2));
+        if (DrawVector3Row("Position", &s.pos.x, 0.02f, "%.3f")) ed.regenerate();
+        ImGui::Dummy(ImVec2(0, 4));
+    }
+    ImGui::Dummy(ImVec2(0, 3));
+
+    if (ComponentHeader("Sound", &openSound, 6)) {
+        ImGui::TextColored(kTextMuted, "File:");
+        ImGui::TextWrapped("%s", s.path.empty() ? "<none>" : s.path.c_str());
+        if (ImGui::Button("Import / Replace Audio...", ImVec2(-1, 22))) {
+            const std::string path = OpenFileDialog(
+                "Audio Files\0*.mp3;*.wav;*.ogg;*.flac\0MP3 Files\0*.mp3\0All Files\0*.*\0");
+            if (!path.empty()) {
+                ed.audio.stop(s.name);
+                ed.audio.unload(s.name);
+                s.path = path;
+                if (ed.audio.ready()) ed.audio.load(s.name, path);
+                ed.regenerate();
+            }
+        }
+
+        ImGui::Dummy(ImVec2(0, 3));
+        ImGui::PushItemWidth(-112.0f);
+        bool changed = false;
+        changed |= ImGui::SliderFloat("Volume", &s.volume, 0.0f, 1.0f);
+        changed |= ImGui::SliderFloat("Pan", &s.pan, -1.0f, 1.0f);
+        changed |= ImGui::DragFloat("Range", &s.range, 0.1f, 0.1f, 1000.0f);
+        changed |= ImGui::Checkbox("Loop", &s.loop);
+        changed |= ImGui::Checkbox("Autoplay", &s.autoplay);
+        changed |= ImGui::Checkbox("Spatial (distance / pan)", &s.spatial);
+        ImGui::PopItemWidth();
+        if (changed) {
+            ed.audio.setVolume(s.name, s.volume);
+            ed.audio.setPan(s.name, s.pan);
+            ed.audio.setLooping(s.name, s.loop);
+            ed.regenerate();
+        }
+
+        ImGui::Dummy(ImVec2(0, 4));
+        const float bw = (ImGui::GetContentRegionAvail().x - 12.0f) / 3.0f;
+        if (ImGui::Button("Play", ImVec2(bw, 24))) {
+            if (!s.path.empty()) {
+                if (!ed.audio.exists(s.name)) ed.audio.load(s.name, s.path);
+                ed.audio.play(s.name, s.loop, s.volume, s.pan);
+            }
+        }
+        ImGui::SameLine(0, 6);
+        if (ImGui::Button("Pause", ImVec2(bw, 24))) ed.audio.pause(s.name);
+        ImGui::SameLine(0, 6);
+        if (ImGui::Button("Stop", ImVec2(bw, 24))) ed.audio.stop(s.name);
+        if (ImGui::Button("Resume", ImVec2(-1, 22))) ed.audio.resume(s.name);
+
+        const bool playing = ed.audio.isPlaying(s.name);
+        const bool paused = ed.audio.isPaused(s.name);
+        ImGui::TextColored(playing ? ImVec4(0.35f, 0.85f, 0.45f, 1.0f)
+                                   : paused ? ImVec4(0.95f, 0.75f, 0.30f, 1.0f)
+                                            : ImVec4(0.55f, 0.55f, 0.55f, 1.0f),
+                           "%s", playing ? "Playing" : paused ? "Paused" : "Stopped");
+        ImGui::Dummy(ImVec2(0, 4));
+    }
+
+    ImGui::Dummy(ImVec2(0, 8));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.13f, 0.14f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.42f, 0.16f, 0.18f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.50f, 0.19f, 0.21f, 1.0f));
+    if (ImGui::Button("Delete Sound", ImVec2(-1, 26))) {
+        ed.scene.removeSound(ed.selectedSound);
+        ed.selectedSound = -1;
+        ed.gizmoDrag.active = false;
+        ed.hoverAxis = -1;
+        ed.regenerate();
+    }
+    ImGui::PopStyleColor(3);
+}
+
 static void DrawInspectorEmpty(Editor& ed) {
     static bool openScene = true;
     static bool openMaterials = true;
@@ -1552,6 +1694,9 @@ static void DrawInspectorEmpty(Editor& ed) {
         ImGui::TextColored(kTextMuted, "Lights:");
         ImGui::SameLine(64.0f);
         ImGui::TextUnformatted(std::to_string(ed.scene.lights.size()).c_str());
+        ImGui::TextColored(kTextMuted, "Sounds:");
+        ImGui::SameLine(64.0f);
+        ImGui::TextUnformatted(std::to_string(ed.scene.sounds.size()).c_str());
         ImGui::TextColored(kTextMuted, "Textures:");
         ImGui::SameLine(64.0f);
         ImGui::TextUnformatted(std::to_string(ed.scene.textures.size()).c_str());
@@ -1609,13 +1754,12 @@ static void DrawInspectorBody(Editor& ed) {
         DrawInspectorObject(ed);
     else if (ed.selectedLight >= 0 && ed.selectedLight < (int)ed.scene.lights.size())
         DrawInspectorLight(ed);
+    else if (ed.selectedSound >= 0 && ed.selectedSound < (int)ed.scene.sounds.size())
+        DrawInspectorSound(ed);
     else
         DrawInspectorEmpty(ed);
 }
 
-// -----------------------------------------------------------------------------
-// Scene Hierarchy
-// -----------------------------------------------------------------------------
 static void DrawHierarchyBody(Editor& ed) {
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.20f, 0.20f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.24f, 0.24f, 1.0f));
@@ -1640,6 +1784,8 @@ static void DrawHierarchyBody(Editor& ed) {
         ImGui::Separator();
         if (ImGui::MenuItem("Point Light")) ed.spawnAtCenter(PlaceMode::PointLight);
         if (ImGui::MenuItem("Spot Light"))  ed.spawnAtCenter(PlaceMode::SpotLight);
+        ImGui::Separator();
+        if (ImGui::MenuItem("Sound"))       ed.spawnAtCenter(PlaceMode::Sound);
         ImGui::EndPopup();
     }
 
@@ -1647,10 +1793,11 @@ static void DrawHierarchyBody(Editor& ed) {
 
     int deleteObj = -1;
     int deleteLight = -1;
+    int deleteSound = -1;
     const float rowH = 22.0f;
 
     auto drawRow = [&](int id, const char* name, const std::string& kind,
-                       bool selected, bool isLight, int index) {
+                       bool selected, bool isLight, bool isSound, int index) {
         ImGui::PushID(id);
         ImDrawList* dl = ImGui::GetWindowDrawList();
         const ImVec2 p = ImGui::GetCursorScreenPos();
@@ -1691,10 +1838,12 @@ static void DrawHierarchyBody(Editor& ed) {
         if (clicked) {
             if (trashHovered) {
                 if (isLight) deleteLight = index;
+                else if (isSound) deleteSound = index;
                 else         deleteObj = index;
             } else {
-                if (isLight) { ed.selectedLight = index; ed.selectedObj = -1; }
-                else         { ed.selectedObj = index; ed.selectedLight = -1; }
+                if (isLight) { ed.selectedLight = index; ed.selectedObj = -1; ed.selectedSound = -1; }
+                else if (isSound) { ed.selectedSound = index; ed.selectedObj = -1; ed.selectedLight = -1; }
+                else         { ed.selectedObj = index; ed.selectedLight = -1; ed.selectedSound = -1; }
             }
         }
         ImGui::PopID();
@@ -1702,16 +1851,20 @@ static void DrawHierarchyBody(Editor& ed) {
 
     for (int i = 0; i < (int)ed.scene.objects.size(); ++i) {
         const auto& o = ed.scene.objects[i];
-        drawRow(i, o.name.c_str(), ObjectKindLabel(o), ed.selectedObj == i, false, i);
+        drawRow(i, o.name.c_str(), ObjectKindLabel(o), ed.selectedObj == i, false, false, i);
     }
     for (int i = 0; i < (int)ed.scene.lights.size(); ++i) {
         const auto& l = ed.scene.lights[i];
         const char* typeName = (l.type == LightType::Spot) ? "spot"
                              : (l.type == LightType::Sun) ? "sun" : "point";
-        drawRow(10000 + i, l.name.c_str(), typeName, ed.selectedLight == i, true, i);
+        drawRow(10000 + i, l.name.c_str(), typeName, ed.selectedLight == i, true, false, i);
+    }
+    for (int i = 0; i < (int)ed.scene.sounds.size(); ++i) {
+        const auto& s = ed.scene.sounds[i];
+        drawRow(20000 + i, s.name.c_str(), "sound", ed.selectedSound == i, false, true, i);
     }
 
-    if (ed.scene.objects.empty() && ed.scene.lights.empty())
+    if (ed.scene.objects.empty() && ed.scene.lights.empty() && ed.scene.sounds.empty())
         ImGui::TextColored(kTextMuted, "  Scene is empty. Use Add.");
 
     if (deleteObj >= 0) {
@@ -1730,15 +1883,19 @@ static void DrawHierarchyBody(Editor& ed) {
         ed.hoverAxis = -1;
         ed.regenerate();
     }
+    if (deleteSound >= 0) {
+        ed.scene.removeSound(deleteSound);
+        if (ed.selectedSound == deleteSound) ed.selectedSound = -1;
+        else if (ed.selectedSound > deleteSound) ed.selectedSound--;
+        ed.gizmoDrag.active = false;
+        ed.hoverAxis = -1;
+        ed.regenerate();
+    }
 }
 
-// -----------------------------------------------------------------------------
-// Asset browser (bottom downbar)
-// -----------------------------------------------------------------------------
 static void DrawAssetsBody(Editor& ed, const std::filesystem::path& assetRoot,
                            std::filesystem::path& browserPath,
                            std::filesystem::path& selectedPath) {
-    // Breadcrumb toolbar
     const bool canUp = !assetRoot.empty() && browserPath != assetRoot &&
                        !browserPath.parent_path().empty();
     if (!canUp) ImGui::BeginDisabled();
@@ -1758,7 +1915,6 @@ static void DrawAssetsBody(Editor& ed, const std::filesystem::path& assetRoot,
 
     ImGui::Dummy(ImVec2(0, 1));
 
-    // Add strip
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.20f, 0.20f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.24f, 0.24f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.27f, 0.27f, 0.27f, 1.0f));
@@ -1778,6 +1934,7 @@ static void DrawAssetsBody(Editor& ed, const std::filesystem::path& assetRoot,
     if (ImGui::BeginPopup("##assetAdd")) {
         if (ImGui::MenuItem("Import Model  (.obj / .fbx)")) ImportModelDialog(ed);
         if (ImGui::MenuItem("Import Texture")) ImportTextureDialog(ed);
+        if (ImGui::MenuItem("Import Sound  (.mp3 / .wav / .ogg)")) ImportSoundDialog(ed);
         ImGui::EndPopup();
     }
 
@@ -1866,6 +2023,8 @@ static void DrawAssetsBody(Editor& ed, const std::filesystem::path& assetRoot,
                 } else if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" ||
                            ext == ".bmp" || ext == ".tga") {
                     RegisterTextureFile(ed, entry.first.string());
+                } else if (ext == ".mp3" || ext == ".wav" || ext == ".ogg" || ext == ".flac") {
+                    RegisterSoundFile(ed, entry.first.string());
                 }
             }
 
@@ -1877,9 +2036,6 @@ static void DrawAssetsBody(Editor& ed, const std::filesystem::path& assetRoot,
     ImGui::EndChild();
 }
 
-// -----------------------------------------------------------------------------
-// Entry point
-// -----------------------------------------------------------------------------
 int main() {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -1926,8 +2082,10 @@ int main() {
 
     Editor ed;
     ed.renderer.init();
+    if (!ed.audio.init())
+        std::fprintf(stderr, "[audio] continuing without sound\n");
+    ed.scene.audio = &ed.audio;
 
-    // UI textures
     GLuint logoTex = 0;
     GLuint playTex = 0;
     GLuint folderTex = 0;
@@ -1935,6 +2093,7 @@ int main() {
     GLuint plusTex = 0;
     GLuint hierarchyTex = 0;
     GLuint settingsTex = 0;
+    GLuint lightTex = 0;
     LoadUIAsset("logo.png", logoTex);
     LoadUIAsset("play.png", playTex);
     LoadUIAsset("folder.png", folderTex);
@@ -1942,12 +2101,12 @@ int main() {
     LoadUIAsset("plus.png", plusTex);
     LoadUIAsset("hirearchy.png", hierarchyTex);
     LoadUIAsset("settings.png", settingsTex);
+    LoadUIAsset("light.png", lightTex);
 
     std::filesystem::path assetRoot = FindAssetsDirectory();
     std::filesystem::path assetBrowserPath = assetRoot;
     std::filesystem::path selectedAssetPath;
 
-    // --- Startup project dialog state ---
     bool projectChosen = false;
     std::string projectError;
     char projectPathBuf[1024] = {0};
@@ -2005,6 +2164,9 @@ int main() {
         } else if (ed.selectedLight >= 0 && ed.selectedLight < (int)ed.scene.lights.size()) {
             target = ed.scene.lights[ed.selectedLight].pos;
             hasTarget = true;
+        } else if (ed.selectedSound >= 0 && ed.selectedSound < (int)ed.scene.sounds.size()) {
+            target = ed.scene.sounds[ed.selectedSound].pos;
+            hasTarget = true;
         }
         if (!hasTarget) return;
         Vec3 dir = normalize(target - ed.camera.pos);
@@ -2033,7 +2195,6 @@ int main() {
             ed.scriptRegen = false;
         }
 
-        // ================= STARTUP PROJECT DIALOG =================
         if (!projectChosen) {
             DrawAppTitleBar(win, logoTex, "Open Project", false, []() {});
 
@@ -2097,7 +2258,6 @@ int main() {
             continue;
         }
 
-        // ================= TITLE BAR =================
         const std::string projectLabel = assetRoot.empty()
             ? std::string("No Project")
             : assetRoot.filename().string();
@@ -2105,6 +2265,7 @@ int main() {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Import Model...")) ImportModelDialog(ed);
                 if (ImGui::MenuItem("Import Texture...")) ImportTextureDialog(ed);
+                if (ImGui::MenuItem("Import Sound...")) ImportSoundDialog(ed);
                 ImGui::Separator();
                 if (ImGui::MenuItem("Apply & Recompile")) applyScript();
                 ImGui::Separator();
@@ -2141,12 +2302,10 @@ int main() {
         ImGui::PopStyleColor();
         ImGui::PopStyleVar();
 
-        // Layout constants
         const float leftW = 240.0f;
         const float rightW = 300.0f;
         const float bottomH = 196.0f;
 
-        // ================= LAYOUT =================
         const ImVec2 root = ImGui::GetCursorScreenPos();
         const float availW = ImGui::GetContentRegionAvail().x;
         const float availH = ImGui::GetContentRegionAvail().y;
@@ -2155,7 +2314,6 @@ int main() {
         const float centerW = std::max(220.0f, availW - leftW - rightW);
         const float bottomW = std::max(260.0f, availW - rightW);
 
-        // --- Scene Hierarchy ---
         ImGui::SetCursorScreenPos(root);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::BeginChild("##panelHierarchy", ImVec2(leftW, topH), true);
@@ -2171,7 +2329,6 @@ int main() {
         }
         ImGui::EndChild();
 
-        // --- Viewport ---
         ImGui::SetCursorScreenPos(ImVec2(root.x + leftW, root.y));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::BeginChild("##panelViewport", ImVec2(centerW, topH), true);
@@ -2208,7 +2365,6 @@ int main() {
                 }
                 ed.scene.runFrameEvents(dt);
 
-                // --- UE5 Style Navigation ---
                 if (hovered) {
                     if (ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
                         ed.camera.yaw += gio.MouseDelta.x * 0.15f;
@@ -2228,7 +2384,6 @@ int main() {
                     }
                 }
 
-                // WASD Fly
                 bool rightMouseDown = ImGui::IsMouseDown(ImGuiMouseButton_Right);
                 if ((hovered || rightMouseDown) && !gio.WantTextInput) {
                     float moveSpeed = ed.camera.speed * dt;
@@ -2242,11 +2397,9 @@ int main() {
                     if (ImGui::IsKeyDown(ImGuiKey_Q)) ed.camera.pos -= ed.camera.up() * moveSpeed;
                 }
 
-                // F to focus on selected object
                 if (!gio.WantCaptureKeyboard && ImGui::IsKeyPressed(ImGuiKey_F))
                     focusSelection();
 
-                // Gizmo mode shortcuts
                 if (!gio.WantCaptureKeyboard && !gio.WantTextInput) {
                     if (ImGui::IsKeyPressed(ImGuiKey_1, false)) ed.gizmoMode = GizmoMode::Move;
                     if (ImGui::IsKeyPressed(ImGuiKey_2, false)) ed.gizmoMode = GizmoMode::Scale;
@@ -2297,10 +2450,9 @@ int main() {
                                              o.textureWrap, o.textureFilter);
                 }
 
-                // Render Lights and Helpers
                 for (auto& l : ed.scene.lights) {
                     if (l.type == LightType::Sun) continue;
-                    ed.renderer.drawWireSphere(l.pos, 0.12f, l.color * 1.3f, 12);
+                    ed.renderer.drawWireSphere(l.pos, 0.32f, l.color * 1.3f, 12);
                     if (l.type == LightType::Point)
                         ed.renderer.drawWireSphere(l.pos, l.range, l.color * 0.35f, 24);
                     if (l.type == LightType::Spot) {
@@ -2331,10 +2483,9 @@ int main() {
                 if (ed.selectedLight >= 0 && ed.selectedLight < (int)ed.scene.lights.size()) {
                     auto& l = ed.scene.lights[ed.selectedLight];
                     if (l.type != LightType::Sun)
-                        ed.renderer.drawWireSphere(l.pos, 0.18f, Vec3(1.0f, 0.85f, 0.20f), 12);
+                        ed.renderer.drawWireSphere(l.pos, 0.45f, Vec3(1.0f, 0.85f, 0.20f), 12);
                 }
 
-                // --- 3D transform gizmo ---
                 {
                     bool hasGizmo = false;
                     bool gizmoIsLight = false;
@@ -2348,11 +2499,14 @@ int main() {
                         gizmoIsLight = true;
                     }
                     if (hasGizmo) {
+                        const Vec3 gizmoRot = (!gizmoIsLight && ed.gizmoMode == GizmoMode::Scale)
+                            ? ed.scene.objects[ed.selectedObj].rot
+                            : Vec3(0, 0, 0);
                         drawGizmo(ed.renderer, gizmoOrigin,
                                   gizmoIsLight ? GizmoMode::Move : ed.gizmoMode,
                                   ed.hoverAxis,
                                   ed.gizmoDrag.active ? ed.gizmoDrag.axis : -1,
-                                  ed.camera, proj, vpH);
+                                  ed.camera, proj, vpH, gizmoRot);
                     }
                 }
                 ed.renderer.unbindFBO();
@@ -2365,7 +2519,46 @@ int main() {
                     ImGui::Dummy(vpSize);
                 }
 
-                // Floating gizmo mode switch
+                // Light gizmos: billboard the light icon at each light position.
+                auto lightIconPos = [&](int index, ImVec2& out) -> bool {
+                    if (index < 0 || index >= (int)ed.scene.lights.size()) return false;
+                    const auto& l = ed.scene.lights[index];
+                    if (l.type == LightType::Sun) return false;
+                    ImVec2 sp;
+                    if (!projectToScreen(l.pos, view, proj, vpW, vpH, sp)) return false;
+                    sp.x += imgOrigin.x;
+                    sp.y += imgOrigin.y;
+                    out = sp;
+                    return true;
+                };
+                if (lightTex) {
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    const float iconHalf = kLightGizmoIconHalf;
+                    for (int i = 0; i < (int)ed.scene.lights.size(); ++i) {
+                        ImVec2 sp;
+                        if (!lightIconPos(i, sp)) continue;
+                        if (sp.x < imgOrigin.x - iconHalf || sp.x > imgOrigin.x + vpSize.x + iconHalf ||
+                            sp.y < imgOrigin.y - iconHalf || sp.y > imgOrigin.y + vpSize.y + iconHalf)
+                            continue;
+                        const auto& l = ed.scene.lights[i];
+                        const bool selected = ed.selectedLight == i;
+                        const ImU32 tint = IM_COL32(
+                            std::clamp(170 + (int)(l.color.x * 85.0f), 0, 255),
+                            std::clamp(170 + (int)(l.color.y * 85.0f), 0, 255),
+                            std::clamp(170 + (int)(l.color.z * 85.0f), 0, 255),
+                            235);
+                        dl->AddCircleFilled(sp, iconHalf + 2.0f,
+                                            selected ? IM_COL32(255, 196, 64, 110)
+                                                     : IM_COL32(0, 0, 0, 120));
+                        dl->AddImage((ImTextureID)(intptr_t)lightTex,
+                                     ImVec2(sp.x - iconHalf, sp.y - iconHalf),
+                                     ImVec2(sp.x + iconHalf, sp.y + iconHalf),
+                                     ImVec2(0, 0), ImVec2(1, 1), tint);
+                        if (selected)
+                            dl->AddCircle(sp, iconHalf + 3.5f, IM_COL32(255, 210, 80, 255), 50, 1.6f);
+                    }
+                }
+
                 const ImVec2 savedCursor = ImGui::GetCursorPos();
                 ImGui::SetCursorScreenPos(ImVec2(imgOrigin.x + 10, imgOrigin.y + 10));
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
@@ -2380,7 +2573,6 @@ int main() {
                 ImGui::SetCursorPos(savedCursor);
                 const bool toolbarHovered = ImGui::IsMouseHoveringRect(toolsMin, toolsMax);
 
-                // Viewport hint line
                 {
                     ImDrawList* dl = ImGui::GetWindowDrawList();
                     const char* hint = "RMB Look    MMB Pan    Scroll Speed    F Focus    Del Delete    Ctrl Snap";
@@ -2388,7 +2580,6 @@ int main() {
                                 IM_COL32(128, 132, 140, 210), hint);
                 }
 
-                // Viewport interactions
                 ImVec2 mouse = ImGui::GetMousePos();
                 float lmX = mouse.x - imgOrigin.x;
                 float lmY = mouse.y - imgOrigin.y;
@@ -2406,11 +2597,16 @@ int main() {
                     gizmoIsLight = true;
                 }
                 const GizmoMode effectiveMode = gizmoIsLight ? GizmoMode::Move : ed.gizmoMode;
+                const Vec3 effectiveRotation =
+                    (hasGizmo && !gizmoIsLight && effectiveMode == GizmoMode::Scale &&
+                     ed.selectedObj >= 0 && ed.selectedObj < (int)ed.scene.objects.size())
+                        ? ed.scene.objects[ed.selectedObj].rot
+                        : Vec3(0, 0, 0);
 
                 if (!ed.gizmoDrag.active) {
                     ed.hoverAxis = (hasGizmo && inside && !toolbarHovered)
                         ? pickGizmoAxis(ImVec2(lmX, lmY), gizmoOrigin, effectiveMode,
-                                        ed.camera, view, proj, vpW, vpH)
+                                        ed.camera, view, proj, vpW, vpH, effectiveRotation)
                         : -1;
                 }
                 if (inside && ed.hoverAxis >= 0 && !ed.gizmoDrag.active)
@@ -2428,11 +2624,12 @@ int main() {
                         d.startPos = gizmoOrigin;
                         d.startMouse = mouse;
                         d.planePoint = gizmoOrigin;
+                        d.gizmoRot = effectiveRotation;
                         if (!gizmoIsLight) d.startSize = ed.scene.objects[ed.selectedObj].size;
 
                         const Ray r = screenRay(lmX, lmY, vpW, vpH, view, proj);
                         if (d.axis >= 0 && d.axis <= 2) {
-                            const Vec3 dir = gizmoAxisDir(d.axis);
+                            const Vec3 dir = gizmoAxisDir(d.axis, d.gizmoRot);
                             const Vec3 viewDir = normalize(gizmoOrigin - ed.camera.pos);
                             Vec3 n = viewDir - dir * dot(viewDir, dir);
                             if (length(n) < 1e-4f) n = cross(dir, Vec3(0, 1, 0));
@@ -2451,26 +2648,45 @@ int main() {
                         ed.gizmoDrag = d;
                         ed.hoverAxis = d.axis;
                     } else {
-                        Ray r = screenRay(lmX, lmY, vpW, vpH, view, proj);
-                        int hitObj = -1, hitLight = -1;
-                        float bestT = 1e30f;
-
-                        for (int i = 0; i < (int)ed.scene.objects.size(); ++i) {
-                            Vec3 mn, mx;
-                            objectWorldAABB(ed.scene.objects[i], mn, mx);
-                            float t;
-                            if (rayAABB(r, mn, mx, t) && t < bestT) { bestT = t; hitObj = i; hitLight = -1; }
-                        }
+                        // Prefer the visible light icon so it can be clicked directly.
+                        int iconLight = -1;
+                        const float iconPickHalf = kLightGizmoIconHalf + 4.0f;
                         for (int i = 0; i < (int)ed.scene.lights.size(); ++i) {
-                            auto& l = ed.scene.lights[i];
-                            if (l.type == LightType::Sun) continue;
-                            float t;
-                            if (rayAABB(r, l.pos - Vec3(0.15f,0.15f,0.15f), l.pos + Vec3(0.15f,0.15f,0.15f), t) && t < bestT) {
-                                bestT = t; hitObj = -1; hitLight = i;
+                            ImVec2 sp;
+                            if (!lightIconPos(i, sp)) continue;
+                            if (std::fabs(mouse.x - sp.x) <= iconPickHalf &&
+                                std::fabs(mouse.y - sp.y) <= iconPickHalf) {
+                                iconLight = i;
+                                break;
                             }
                         }
-                        ed.selectedObj = hitObj;
-                        ed.selectedLight = hitLight;
+
+                        if (iconLight >= 0) {
+                            ed.selectedLight = iconLight;
+                            ed.selectedObj = -1;
+                            ed.selectedSound = -1;
+                        } else {
+                            Ray r = screenRay(lmX, lmY, vpW, vpH, view, proj);
+                            int hitObj = -1, hitLight = -1;
+                            float bestT = 1e30f;
+
+                            for (int i = 0; i < (int)ed.scene.objects.size(); ++i) {
+                                Vec3 mn, mx;
+                                objectWorldAABB(ed.renderer, ed.scene.objects[i], mn, mx);
+                                float t;
+                                if (rayAABB(r, mn, mx, t) && t < bestT) { bestT = t; hitObj = i; hitLight = -1; }
+                            }
+                            for (int i = 0; i < (int)ed.scene.lights.size(); ++i) {
+                                auto& l = ed.scene.lights[i];
+                                if (l.type == LightType::Sun) continue;
+                                float t;
+                                if (rayAABB(r, l.pos - Vec3(0.40f,0.40f,0.40f), l.pos + Vec3(0.40f,0.40f,0.40f), t) && t < bestT) {
+                                    bestT = t; hitObj = -1; hitLight = i;
+                                }
+                            }
+                            ed.selectedObj = hitObj;
+                            ed.selectedLight = hitLight;
+                        }
                     }
                 }
 
@@ -2548,7 +2764,6 @@ int main() {
         }
         ImGui::EndChild();
 
-        // --- Assets downbar ---
         ImGui::SetCursorScreenPos(ImVec2(root.x, root.y + topH));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::BeginChild("##panelAssets", ImVec2(bottomW, bottomActualH), true);
@@ -2564,13 +2779,12 @@ int main() {
         }
         ImGui::EndChild();
 
-        // --- Inspector / Script ---
         ImGui::SetCursorScreenPos(ImVec2(root.x + availW - rightW, root.y));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::BeginChild("##panelInspector", ImVec2(rightW, availH), true);
         ImGui::PopStyleVar();
         {
-            PanelTabDef tabs[] = {{"Inspector", settingsTex}, {"Script", 0}};
+            PanelTabDef tabs[] = {{"Inspector", settingsTex}, {"Scribe", 0}};
             const int clicked = PanelHeader(tabs, 2, rightTab);
             if (clicked >= 0) rightTab = clicked;
 
@@ -2581,7 +2795,7 @@ int main() {
             if (rightTab == 0) {
                 DrawInspectorBody(ed);
             } else {
-                ImGui::TextColored(kTextMuted, "Scene script");
+                ImGui::TextColored(kTextMuted, "Scribe scene");
                 ImGui::Dummy(ImVec2(0, 2));
                 const float scriptH = std::max(80.0f, ImGui::GetContentRegionAvail().y - 44.0f);
                 ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.10f, 0.10f, 1.0f));
@@ -2601,7 +2815,7 @@ int main() {
         }
         ImGui::EndChild();
 
-        ImGui::End(); // Host
+        ImGui::End();
 
         HandleWindowBorderResize(win);
 
@@ -2615,6 +2829,7 @@ int main() {
     }
 
     ed.renderer.shutdown();
+    ed.audio.shutdown();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

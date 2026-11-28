@@ -104,7 +104,10 @@ bool loadFBX(const std::string& path, FBXModelData& out, std::string* error) {
             maxPoint.z = std::max(maxPoint.z, part.mesh.vertices[i + 2]);
         }
     }
-    const aiVector3D center = (minPoint + maxPoint) * 0.5f;
+    // Match the engine's model fitting: center on X/Z, bottom on the pivot.
+    const aiVector3D center((minPoint.x + maxPoint.x) * 0.5f,
+                            minPoint.y,
+                            (minPoint.z + maxPoint.z) * 0.5f);
     const float largestDimension = std::max({
         maxPoint.x - minPoint.x, maxPoint.y - minPoint.y, maxPoint.z - minPoint.z
     });

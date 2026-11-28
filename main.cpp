@@ -1824,7 +1824,7 @@ std::printf("BVH: %zu nodes, root power=%.4f, bmin=(%.2f,%.2f,%.2f), bmax=(%.2f,
             for (double a : passAcc) total += a;
             char title[300];
             std::snprintf(title, sizeof(title),
-                          "rt_renderer | GPU %.2f ms | %zu objects, %u lights (area:%s), DI:%s | GI:%s rate:%d | temporal:%s spatial:%s | DI cand:%u | bounces:%u | view:%u",
+                          "game | GPU %.2f ms | %zu objects, %u lights (area:%s), DI:%s | GI:%s rate:%d | temporal:%s spatial:%s | DI cand:%u | bounces:%u | view:%u",
                           total / accFrames, world.objects.size(), numLights, world.areaLights ? "on" : "off",
             (lightMode == 0 ? "global" : lightMode == 1 ? "tile/grid" : lightMode == 2 ? "BVH" : "solaridi"),
                           world.giMode == 0 ? "path" : world.giMode == 1 ? "surface cache" : "screen+BVH",
